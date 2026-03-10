@@ -1,0 +1,34 @@
+{
+  "input": "你的论文.pdf", // 输入 PDF 路径（必填；也可在命令行用 --input 指定）
+  "output": "references_output", // 输出目录
+
+  "pdf_parser": "pypdf", // pypdf / pdfplumber
+  "header_margin": 40.0, // pdfplumber 顶部裁剪边距（减少页眉干扰）
+  "footer_margin": 40.0, // pdfplumber 底部裁剪边距（减少页脚干扰）
+
+  "timeout": 20, // 单次下载 HTTP 超时（秒）
+  "lookup_timeout": 6, // 二次检索 API 超时（秒）
+  "retries": 1, // 每个候选链接的重试次数
+  "cookies": "", // cookies.txt 路径（Netscape 格式；留空则不使用；请勿分享该文件）
+  "verify_title_rename": false, // 下载后读取 PDF 标题做匹配校验，命中则按标题重命名
+  "verify_title_threshold": 0.55, // 标题匹配阈值（0~1，越大越严格）
+  "verified_subdir": "verified_pdfs", // 校验通过的 PDF 额外放到 downloads/<subdir>（空字符串禁用）
+
+  "workers": 8, // 并发线程数
+  "max_per_domain": 2, // 每个域名最大并发请求数（0 表示不限制）
+  "min_domain_delay_ms": 0, // 同一域名两次请求之间最小间隔（毫秒）
+  "user_agent": "ReferenceDownloader/1.1", // HTTP User-Agent
+
+  "download_log": "download_log.csv", // 下载尝试日志文件名（空字符串可禁用）
+
+  "max_candidates_per_item": 3, // 每条参考文献最多尝试多少个链接（0 表示不限）
+  "skip_doi": false, // 初次下载阶段是否跳过 DOI 直连
+  "download_max": 0, // 最多尝试下载多少条参考文献（0 表示全部；只限制下载，不限制解析输出）
+
+  "secondary_lookup": false, // 是否对失败项做二次检索（Crossref/OpenAlex）
+  "secondary_max": 40, // 二次检索最多处理多少条失败项
+  "secondary_top_k": 2, // 二次检索：按标题相似度排序，仅保留前 K 个候选（0 表示不限制）
+
+  "no_download": false, // 仅解析与导出，不进行任何下载
+  "no_progress": false // 关闭进度条（未安装 tqdm 时自动无进度条）
+}
