@@ -113,3 +113,18 @@ python reference_tool.py --input "你的论文.pdf" --output references_output -
   - `test_html_parsers.py`：站点 HTML 解析校验
 
 说明：handler 与主流程通过“helpers”解耦，站点文件仅依赖 `core/*` 暴露的工具函数，便于后续增加新站点或替换实现。
+
+## Desktop GUI (New)
+If you prefer a visual interface, run:
+`powershell
+python reference_tool_gui.py
+`
+
+What the GUI provides:
+- Select input PDF, output folder, config file, and cookies file with file pickers.
+- Configure common runtime options (workers, timeout, retries, secondary lookup, resume, etc.).
+- Load an existing JSON config into the form.
+- Save current form settings to a JSON config.
+- Run 
+eference_tool.py from the GUI and stream live logs.
+- Stop a running task from the GUI.

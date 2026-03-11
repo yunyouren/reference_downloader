@@ -27,6 +27,16 @@ class TestCore(unittest.TestCase):
         self.assertTrue(c[0].endswith(".pdf") or "stampdf" in c[0].lower())
         self.assertTrue(any(u.endswith("doi.org/10.1000/xyz") or u.endswith("/10.1000/xyz") for u in c))
 
+    def test_generic_site_templates_expand(self):
+        item = rt.ReferenceItem(number=1, text="A sample paper title", dois=["10.1000/xyz"], urls=[])
+        sites = [
+            "https://sci-hub.se/{doi}",
+            "https://example.org/search?q={title_encoded}",
+        ]
+        c = list(rt.iter_candidate_urls_with_generic_sites(item, use_doi=True, generic_download_sites=sites))
+        self.assertTrue(any("sci-hub.se/10.1000/xyz" in u for u in c))
+        self.assertTrue(any("example.org/search?q=" in u for u in c))
+
     def test_config_loader_trailing_commas(self):
         tmp = Path("tests/tmp.json")
         obj = {"a": 1, "b": {"c": 2}}
@@ -35,6 +45,17 @@ class TestCore(unittest.TestCase):
             tmp.write_text(text, encoding="utf-8")
             data = rt.load_config_file(tmp)
             self.assertEqual(data, obj)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+
+    def test_config_loader_utf8_bom(self):
+        tmp = Path("tests/tmp_bom.json")
+        text = "\ufeff" + '{ "a": 1 }'
+        try:
+            tmp.write_text(text, encoding="utf-8")
+            data = rt.load_config_file(tmp)
+            self.assertEqual(data, {"a": 1})
         finally:
             if tmp.exists():
                 tmp.unlink()

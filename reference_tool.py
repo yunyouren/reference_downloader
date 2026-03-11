@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import random
 import re
 import sys
@@ -50,6 +51,7 @@ from core.http import is_probably_pdf, parse_retry_after_seconds, should_record_
 from core.html import extract_springer_pdf_url, extract_ieee_arnumber, extract_ieee_pdf_url
 from core.urls import normalize_candidate_url
 from core.verify import (
+    build_verified_pdf_name,
     VerifyWeights,
     extract_pdf_best_line_score,
     extract_pdf_first_page_text,
@@ -412,8 +414,12 @@ def parse_retry_after_seconds(value: str) -> float | None:
     raw = (value or "").strip()
     if not raw:
         return None
-    if raw.isdigit():
-        return float(int(raw))
+    try:
+        seconds = float(raw)
+        if math.isfinite(seconds):
+            return max(0.0, seconds)
+    except Exception:
+        pass
     try:
         dt = parsedate_to_datetime(raw)
         if dt is None:
@@ -509,7 +515,7 @@ def load_config_file(path: Path) -> dict:
             i += 1
         return "".join(out)
 
-    raw = path.read_text(encoding="utf-8")
+    raw = path.read_text(encoding="utf-8-sig")
     normalized = strip_trailing_commas(strip_jsonc(raw))
     data = json.loads(normalized)
     if not isinstance(data, dict):
@@ -1121,6 +1127,76 @@ def iter_candidate_urls(item: ReferenceItem, use_doi: bool = True) -> Iterable[s
             yield f"https://doi.org/{quote(doi, safe=':/')}"
 
 
+def normalize_generic_download_sites(raw: object) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw_values = [x.strip() for x in raw.split(",")]
+    elif isinstance(raw, list):
+        raw_values = [str(x).strip() for x in raw]
+    else:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in raw_values:
+        if not value:
+            continue
+        if not value.startswith(("http://", "https://")):
+            continue
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def build_generic_site_candidates(item: ReferenceItem, generic_download_sites: list[str] | None) -> list[str]:
+    sites = normalize_generic_download_sites(generic_download_sites)
+    if not sites:
+        return []
+    title = guess_title_query(item.text)
+    out: list[str] = []
+    seen: set[str] = set()
+    for template in sites:
+        # If template contains DOI placeholders, expand one URL per DOI.
+        if "{doi" in template:
+            for doi in item.dois:
+                d = str(doi or "").strip()
+                if not d:
+                    continue
+                built = (
+                    template.replace("{doi}", d)
+                    .replace("{doi_encoded}", quote(d, safe=""))
+                    .replace("{title}", title)
+                    .replace("{title_encoded}", quote(title, safe=""))
+                )
+                normalized = normalize_candidate_url(built)
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    out.append(normalized)
+            continue
+        built = (
+            template.replace("{title}", title)
+            .replace("{title_encoded}", quote(title, safe=""))
+        )
+        normalized = normalize_candidate_url(built)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            out.append(normalized)
+    return out
+
+
+def iter_candidate_urls_with_generic_sites(
+    item: ReferenceItem,
+    use_doi: bool = True,
+    generic_download_sites: list[str] | None = None,
+) -> Iterable[str]:
+    for url in iter_candidate_urls(item, use_doi=use_doi):
+        yield url
+    for url in build_generic_site_candidates(item, generic_download_sites):
+        yield url
+
+
 def extract_springer_pdf_url(html_text: str, base_url: str) -> str | None:
     m = re.search(
         r'<meta[^>]+name=["\']citation_pdf_url["\'][^>]+content=["\']([^"\']+)["\']',
@@ -1207,6 +1283,7 @@ def verify_downloaded_pdf_and_update_item(
     phase: str,
     logger: DownloadLogger,
     verify_title_threshold: float,
+    verify_rename_mode: str,
     verify_weights,
 ) -> bool:
     prefix = f"{item.number:03d}"
@@ -1223,6 +1300,7 @@ def verify_downloaded_pdf_and_update_item(
         ref_year=ref_year,
         surname=surname,
         verify_title_threshold=float(verify_title_threshold),
+        verify_rename_mode=str(verify_rename_mode or "number_and_original"),
         verify_weights=verify_weights,
     )
     if decision.outcome == "downloaded_pdf":
@@ -1288,6 +1366,7 @@ def handle_springer_html(
     attempt: int,
     verify_title_rename: bool,
     verify_title_threshold: float,
+    verify_rename_mode: str,
     logger: DownloadLogger,
     phase: str,
     seen: set[str],
@@ -1383,13 +1462,16 @@ def handle_springer_html(
                     item.downloaded_file = out_file.name
                     item.note = final_pdf_url
                     name_source = best_line if line_score > title_score and best_line else pdf_title
-                    name = sanitize_filename_component(name_source or expected)
-                    if name:
-                        renamed = unique_path(downloads_dir / f"{prefix} {name}.pdf")
-                        if renamed.name != out_file.name:
-                            out_file.replace(renamed)
-                            out_file = renamed
-                            item.downloaded_file = out_file.name
+                    target_name = build_verified_pdf_name(
+                        prefix=prefix,
+                        original_name=(name_source or expected),
+                        rename_mode=str(verify_rename_mode or "number_and_original"),
+                    )
+                    renamed = unique_path(downloads_dir / target_name)
+                    if renamed.name != out_file.name:
+                        out_file.replace(renamed)
+                        out_file = renamed
+                        item.downloaded_file = out_file.name
                     out_file, rel_path = move_verified_pdf(out_file, downloads_dir=downloads_dir, verified_dir=verified_dir)
                     item.downloaded_file = rel_path
                     item.note = f"{final_pdf_url} | title_match={score:.3f} | title_score={title_score:.3f} | line_score={line_score:.3f} | year_hit={int(year_hit)} | author_hit={int(author_hit)}"
@@ -1460,6 +1542,7 @@ def handle_ieee_html(
     attempt: int,
     verify_title_rename: bool,
     verify_title_threshold: float,
+    verify_rename_mode: str,
     logger: DownloadLogger,
     phase: str,
     seen: set[str],
@@ -1558,13 +1641,16 @@ def handle_ieee_html(
                             item.downloaded_file = out_file.name
                             item.note = stamp_final_url
                             name_source = best_line if line_score > title_score and best_line else pdf_title
-                            name = sanitize_filename_component(name_source or expected)
-                            if name:
-                                renamed = unique_path(downloads_dir / f"{prefix} {name}.pdf")
-                                if renamed.name != out_file.name:
-                                    out_file.replace(renamed)
-                                    out_file = renamed
-                                    item.downloaded_file = out_file.name
+                            target_name = build_verified_pdf_name(
+                                prefix=prefix,
+                                original_name=(name_source or expected),
+                                rename_mode=str(verify_rename_mode or "number_and_original"),
+                            )
+                            renamed = unique_path(downloads_dir / target_name)
+                            if renamed.name != out_file.name:
+                                out_file.replace(renamed)
+                                out_file = renamed
+                                item.downloaded_file = out_file.name
                             out_file, rel_path = move_verified_pdf(out_file, downloads_dir=downloads_dir, verified_dir=verified_dir)
                             item.downloaded_file = rel_path
                             item.note = f"{stamp_final_url} | title_match={score:.3f} | title_score={title_score:.3f} | line_score={line_score:.3f} | year_hit={int(year_hit)} | author_hit={int(author_hit)}"
@@ -1672,13 +1758,16 @@ def handle_ieee_html(
                                 item.downloaded_file = out_file.name
                                 item.note = final_pdf_url
                                 name_source = best_line if line_score > title_score and best_line else pdf_title
-                                name = sanitize_filename_component(name_source or expected)
-                                if name:
-                                    renamed = unique_path(downloads_dir / f"{prefix} {name}.pdf")
-                                    if renamed.name != out_file.name:
-                                        out_file.replace(renamed)
-                                        out_file = renamed
-                                        item.downloaded_file = out_file.name
+                                target_name = build_verified_pdf_name(
+                                    prefix=prefix,
+                                    original_name=(name_source or expected),
+                                    rename_mode=str(verify_rename_mode or "number_and_original"),
+                                )
+                                renamed = unique_path(downloads_dir / target_name)
+                                if renamed.name != out_file.name:
+                                    out_file.replace(renamed)
+                                    out_file = renamed
+                                    item.downloaded_file = out_file.name
                                 out_file, rel_path = move_verified_pdf(out_file, downloads_dir=downloads_dir, verified_dir=verified_dir)
                                 item.downloaded_file = rel_path
                                 item.note = f"{final_pdf_url} | title_match={score:.3f} | title_score={title_score:.3f} | line_score={line_score:.3f} | year_hit={int(year_hit)} | author_hit={int(author_hit)}"
@@ -1758,8 +1847,10 @@ def try_download(
     phase: str,
     verify_title_rename: bool,
     verify_title_threshold: float,
+    verify_rename_mode: str,
     verify_weights: VerifyWeights | dict | None,
     verified_dir: Path | None,
+    generic_download_sites: list[str] | None = None,
 ) -> None:
     """
     尝试为单条参考文献下载 PDF，或保存落地页 URL。
@@ -1783,7 +1874,11 @@ def try_download(
     best_landing_candidate = ""
     best_landing_status_code = 0
     best_landing_content_type = ""
-    for candidate in iter_candidate_urls(item, use_doi=use_doi):
+    for candidate in iter_candidate_urls_with_generic_sites(
+        item,
+        use_doi=use_doi,
+        generic_download_sites=generic_download_sites,
+    ):
         if candidate in seen:
             continue
         seen.add(candidate)
@@ -1885,6 +1980,7 @@ def try_download(
                                     phase=phase,
                                     logger=logger,
                                     verify_title_threshold=float(verify_title_threshold),
+                                    verify_rename_mode=str(verify_rename_mode),
                                     verify_weights=verify_weights,
                                 )
                                 if item.download_status == "downloaded_pdf":
@@ -1937,6 +2033,7 @@ def try_download(
                             attempt=attempt,
                             verify_title_rename=verify_title_rename,
                             verify_title_threshold=float(verify_title_threshold),
+                            verify_rename_mode=str(verify_rename_mode),
                             verify_weights=verify_weights,
                             logger=logger,
                             phase=phase,
@@ -2021,9 +2118,11 @@ def run_initial_download_phase(
     cookies_jar: MozillaCookieJar | None,
     verify_title_rename: bool,
     verify_title_threshold: float,
+    verify_rename_mode: str,
     verify_weights: VerifyWeights | dict | None,
     verified_dir: Path | None,
     domain_cookies: dict[str, MozillaCookieJar] | None = None,
+    generic_download_sites: list[str] | None = None,
 ) -> None:
     """
     初次下载阶段：并发尝试每条参考文献的候选链接。
@@ -2082,8 +2181,10 @@ def run_initial_download_phase(
             phase="initial",
             verify_title_rename=verify_title_rename,
             verify_title_threshold=verify_title_threshold,
+            verify_rename_mode=verify_rename_mode,
             verify_weights=verify_weights,
             verified_dir=verified_dir,
+            generic_download_sites=generic_download_sites,
         )
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
@@ -2116,10 +2217,12 @@ def enrich_failed_references(
     cookies_jar: MozillaCookieJar | None,
     verify_title_rename: bool,
     verify_title_threshold: float,
+    verify_rename_mode: str,
     verify_weights: VerifyWeights | dict | None,
     verified_dir: Path | None,
     secondary_cache: SecondaryLookupCache | None,
     unpaywall_email: str = "",
+    generic_download_sites: list[str] | None = None,
 ) -> None:
     """
     二次检索阶段：对初次下载失败的条目调用 Crossref/OpenAlex 补全 DOI/URL，再重试下载。
@@ -2237,8 +2340,10 @@ def enrich_failed_references(
                 phase="secondary",
                 verify_title_rename=verify_title_rename,
                 verify_title_threshold=verify_title_threshold,
+                verify_rename_mode=verify_rename_mode,
                 verify_weights=verify_weights,
                 verified_dir=verified_dir,
+                generic_download_sites=generic_download_sites,
             )
             if item.download_status != "failed":
                 item.note = f"{item.note} | resolved_by=secondary_lookup".strip()
@@ -2383,6 +2488,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retries", type=int, default=1, help="Retries per candidate URL")
     parser.add_argument("--cookies", help="cookies.txt (Netscape) path for authenticated downloads")
     parser.add_argument("--verify-title-rename", action="store_true", help="Verify downloaded PDF title and rename on match")
+    parser.add_argument(
+        "--verify-rename-mode",
+        choices=["original", "number_only", "number_and_original"],
+        default="number_and_original",
+        help="Rename mode when verify-title-rename is enabled",
+    )
     parser.add_argument("--verify-title-threshold", type=float, default=0.55, help="Title match threshold (Jaccard)")
     parser.add_argument("--verify-title-weight", type=float, default=1.0, help="Verify score: weight for PDF title match")
     parser.add_argument("--verify-line-weight", type=float, default=1.0, help="Verify score: weight for first-page best line match")
@@ -2430,6 +2541,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--secondary-max", type=int, default=40, help="Secondary phase max failed items")
     parser.add_argument("--secondary-top-k", type=int, default=2, help="Secondary lookup: keep top K title-similar candidates (0 means all)")
     parser.add_argument("--secondary-cache", default="cache/secondary_lookup_cache.json", help="Secondary lookup cache file (relative to output; empty disables)")
+    parser.add_argument(
+        "--generic-download-sites",
+        nargs="*",
+        default=[],
+        help=(
+            "Extra generic download site URL templates, e.g. "
+            "'https://sci-hub.se/{doi}' or 'https://example.org/search?q={title_encoded}'"
+        ),
+    )
     parser.add_argument("--no-download", action="store_true", help="Only extract and number references")
 
     # 域名cookies配置
@@ -2490,14 +2610,21 @@ def main() -> None:
 
     if not input_pdf.exists():
         raise FileNotFoundError(f"Input PDF does not exist: {input_pdf}")
+    if not input_pdf.is_file():
+        raise ValueError(f"Input PDF is not a file: {input_pdf}")
+    if input_pdf.stat().st_size <= 0:
+        raise ValueError(f"Input PDF is empty: {input_pdf}")
 
     # 1) 读取全文文本（不同后端对页眉页脚/分栏的抗噪能力不同）
-    full_text = read_pdf_text(
-        input_pdf,
-        parser=args.pdf_parser,
-        header_margin=args.header_margin,
-        footer_margin=args.footer_margin,
-    )
+    try:
+        full_text = read_pdf_text(
+            input_pdf,
+            parser=args.pdf_parser,
+            header_margin=args.header_margin,
+            footer_margin=args.footer_margin,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read input PDF: {input_pdf} ({exc})") from exc
     # 2) 截取参考文献章节，并按风格分段成条目
     ref_section = extract_references_section(full_text)
     refs = split_references(ref_section)
@@ -2533,6 +2660,7 @@ def main() -> None:
 
     # 加载域名cookies
     domain_cookies = load_domain_cookies(domain_cookies_config, Path.cwd())
+    generic_download_sites = normalize_generic_download_sites(getattr(args, "generic_download_sites", []))
 
     output_dir.mkdir(parents=True, exist_ok=True)
     downloads_dir.mkdir(parents=True, exist_ok=True)
@@ -2568,9 +2696,11 @@ def main() -> None:
             cookies_jar=cookies_jar,
             verify_title_rename=bool(args.verify_title_rename),
             verify_title_threshold=float(args.verify_title_threshold),
+            verify_rename_mode=str(getattr(args, "verify_rename_mode", "number_and_original")),
             verify_weights=verify_weights,
             verified_dir=verified_dir,
             domain_cookies=domain_cookies,
+            generic_download_sites=generic_download_sites,
         )
         if args.secondary_lookup:
             # 4) 二次检索：只针对失败项补全 DOI/URL 再下载
@@ -2596,10 +2726,12 @@ def main() -> None:
                 cookies_jar=cookies_jar,
                 verify_title_rename=bool(args.verify_title_rename),
                 verify_title_threshold=float(args.verify_title_threshold),
+                verify_rename_mode=str(getattr(args, "verify_rename_mode", "number_and_original")),
                 verify_weights=verify_weights,
                 verified_dir=verified_dir,
                 secondary_cache=secondary_cache,
                 unpaywall_email=str(getattr(args, "unpaywall_email", "") or ""),
+                generic_download_sites=generic_download_sites,
             )
         if args.download_log:
             logger.write_csv(output_dir / args.download_log)
@@ -2618,4 +2750,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1)

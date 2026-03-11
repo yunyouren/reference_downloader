@@ -21,6 +21,7 @@ def handle_ieee_html(
     attempt: int,
     verify_title_rename: bool,
     verify_title_threshold: float,
+    verify_rename_mode: str,
     verify_weights,
     logger,
     phase: str,
@@ -123,6 +124,7 @@ def handle_ieee_html(
                             phase=phase,
                             logger=logger,
                             verify_title_threshold=float(verify_title_threshold),
+                            verify_rename_mode=str(verify_rename_mode or "number_and_original"),
                             verify_weights=verify_weights,
                         )
                         return "downloaded" if item.download_status == "downloaded_pdf" else "continue"
@@ -195,6 +197,7 @@ def handle_ieee_html(
                                 phase=phase,
                                 logger=logger,
                                 verify_title_threshold=float(verify_title_threshold),
+                                verify_rename_mode=str(verify_rename_mode or "number_and_original"),
                                 verify_weights=verify_weights,
                             )
                             return "downloaded" if item.download_status == "downloaded_pdf" else "continue"

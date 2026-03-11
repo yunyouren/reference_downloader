@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 
@@ -13,8 +14,12 @@ def parse_retry_after_seconds(value: str) -> float | None:
     raw = (value or "").strip()
     if not raw:
         return None
-    if raw.isdigit():
-        return float(int(raw))
+    try:
+        seconds = float(raw)
+        if math.isfinite(seconds):
+            return max(0.0, seconds)
+    except Exception:
+        pass
     try:
         dt = parsedate_to_datetime(raw)
         if dt is None:

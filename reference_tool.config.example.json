@@ -39,6 +39,9 @@
   "secondary_max": 40, // 二次检索最多处理多少条失败项
   "secondary_top_k": 2, // 二次检索：按标题相似度排序，仅保留前 K 个候选（0 表示不限制）
   "secondary_cache": "cache/secondary_lookup_cache.json", // 二次检索缓存文件（相对于 output；空字符串禁用）
+  "generic_download_sites": [
+    "https://sci-hub.se/{doi}"
+  ], // 自定义通用下载站点模板；支持 {doi}/{doi_encoded}/{title}/{title_encoded}
 
   "no_download": false, // 仅解析与导出，不进行任何下载
   "no_progress": false, // 关闭进度条（未安装 tqdm 时自动无进度条）

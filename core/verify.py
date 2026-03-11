@@ -46,6 +46,20 @@ def move_verified_pdf(out_file: Path, downloads_dir: Path, verified_dir: Path | 
     return dest, rel
 
 
+RenameMode = Literal["original", "number_only", "number_and_original"]
+
+
+def build_verified_pdf_name(*, prefix: str, original_name: str, rename_mode: RenameMode) -> str:
+    clean = sanitize_filename_component(original_name)
+    mode = str(rename_mode or "number_and_original").strip().lower()
+    if mode == "original":
+        return f"{clean}.pdf" if clean else f"{prefix}.pdf"
+    if mode == "number_only":
+        return f"{prefix}.pdf"
+    # default: number + original
+    return f"{prefix} {clean}.pdf" if clean else f"{prefix}.pdf"
+
+
 def normalize_title_tokens(text: str) -> list[str]:
     raw = (text or "").lower()
     raw = re.sub(r"[\u2010-\u2015\u2212]", "-", raw)
@@ -260,6 +274,7 @@ def verify_and_rename_pdf(
     surname: str,
     verify_title_threshold: float,
     verify_weights,
+    verify_rename_mode: RenameMode = "number_and_original",
     reader_cls=PdfReader,
 ) -> VerifyDecision:
     pdf_title = extract_pdf_title_from_file(out_file, reader_cls=reader_cls) or ""
@@ -282,9 +297,10 @@ def verify_and_rename_pdf(
 
     if score >= float(verify_title_threshold):
         name_source = best_line if (line_score * float(weights.line_weight)) > (title_score * float(weights.title_weight)) and best_line else pdf_title
-        name = sanitize_filename_component(name_source or expected_title)
-        if name:
-            renamed = unique_path(downloads_dir / f"{prefix} {name}.pdf")
+        target_name = build_verified_pdf_name(prefix=prefix, original_name=(name_source or expected_title), rename_mode=verify_rename_mode)
+        desired = downloads_dir / target_name
+        if desired.resolve() != out_file.resolve():
+            renamed = unique_path(desired)
             if renamed.name != out_file.name:
                 out_file.replace(renamed)
                 out_file = renamed
