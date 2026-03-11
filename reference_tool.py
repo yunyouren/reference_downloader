@@ -33,6 +33,7 @@ import re
 import sys
 import threading
 import time
+import hashlib
 from http.cookiejar import Cookie, MozillaCookieJar
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
@@ -44,6 +45,21 @@ from urllib.parse import quote, urljoin, urlparse
 
 import requests  # type: ignore[import-untyped]
 from requests.adapters import HTTPAdapter  # type: ignore[import-untyped]
+import site_handlers
+from core.http import is_probably_pdf, parse_retry_after_seconds, should_record_landing_url
+from core.html import extract_springer_pdf_url, extract_ieee_arnumber, extract_ieee_pdf_url
+from core.urls import normalize_candidate_url
+from core.verify import (
+    VerifyWeights,
+    extract_pdf_best_line_score,
+    extract_pdf_first_page_text,
+    extract_pdf_title_from_file,
+    move_verified_pdf,
+    sanitize_filename_component,
+    title_match_score,
+    unique_path,
+    verify_and_rename_pdf,
+)
 
 try:
     from pypdf import PdfReader
@@ -109,6 +125,50 @@ class ReferenceItem:
     note: str = ""
 
 
+def apply_resume_state(refs: list[ReferenceItem], output_dir: Path, downloads_dir: Path) -> None:
+    state_file = output_dir / "references.json"
+    if not state_file.exists():
+        return
+    try:
+        data = json.loads(state_file.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if not isinstance(data, list):
+        return
+    by_num = {r.number: r for r in refs}
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        try:
+            num = int(row.get("number"))
+        except Exception:
+            continue
+        item = by_num.get(num)
+        if item is None:
+            continue
+        status = str(row.get("download_status") or "")
+        downloaded_file = str(row.get("downloaded_file") or "")
+        note = str(row.get("note") or "")
+        if status not in {"downloaded_pdf", "saved_landing_url"}:
+            continue
+        p = downloads_dir / downloaded_file if downloaded_file else None
+        if p is not None and p.exists():
+            item.download_status = status
+            item.downloaded_file = downloaded_file
+            item.note = note
+            continue
+        if status == "downloaded_pdf":
+            prefix = f"{num:03d}"
+            matches = list(downloads_dir.rglob(f"{prefix}*.pdf"))
+            matches = [m for m in matches if m.is_file()]
+            matches = [m for m in matches if "__mismatch" not in m.name]
+            if len(matches) == 1:
+                rel = matches[0].relative_to(downloads_dir).as_posix()
+                item.download_status = status
+                item.downloaded_file = rel
+                item.note = note
+
+
 @dataclass
 class DownloadAttempt:
     phase: str
@@ -157,6 +217,39 @@ class DownloadLogger:
                 writer.writerow(asdict(row))
 
 
+class SecondaryLookupCache:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._lock = threading.Lock()
+        self._data: dict[str, dict] = {}
+        if self._path.exists():
+            try:
+                self._data = json.loads(self._path.read_text(encoding="utf-8")) or {}
+            except Exception:
+                self._data = {}
+
+    def get(self, key: str) -> tuple[list[str], list[str]] | None:
+        with self._lock:
+            row = self._data.get(key)
+        if not isinstance(row, dict):
+            return None
+        dois = row.get("dois")
+        urls = row.get("urls")
+        if not isinstance(dois, list) or not isinstance(urls, list):
+            return None
+        return [str(x) for x in dois], [str(x) for x in urls]
+
+    def set(self, key: str, dois: list[str], urls: list[str]) -> None:
+        with self._lock:
+            self._data[key] = {"ts": time.time(), "dois": list(dois), "urls": list(urls)}
+
+    def flush(self) -> None:
+        with self._lock:
+            data = dict(self._data)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 class DomainLimiter:
     def __init__(self, max_per_domain: int, min_delay_ms: int) -> None:
         self._max_per_domain = max_per_domain
@@ -164,12 +257,35 @@ class DomainLimiter:
         self._lock = threading.Lock()
         self._semaphores: dict[str, threading.Semaphore] = {}
         self._next_allowed: dict[str, float] = {}
+        self._backoff_until: dict[str, float] = {}
 
     def __enter__(self) -> "DomainLimiter":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         return None
+
+    def backoff(self, host: str, seconds: float, now: float | None = None) -> None:
+        key = (host or "").lower()
+        if not key:
+            return
+        s = float(seconds)
+        if s <= 0:
+            return
+        t = time.monotonic() if now is None else float(now)
+        until = t + s
+        with self._lock:
+            self._backoff_until[key] = max(self._backoff_until.get(key, 0.0), until)
+
+    def compute_wait_seconds(self, host: str, now: float | None = None) -> float:
+        key = (host or "").lower()
+        if not key:
+            return 0.0
+        t = time.monotonic() if now is None else float(now)
+        with self._lock:
+            next_allowed = self._next_allowed.get(key, 0.0)
+            backoff_until = self._backoff_until.get(key, 0.0)
+        return max(0.0, max(next_allowed, backoff_until) - t)
 
     def acquire(self, host: str) -> threading.Semaphore | None:
         key = (host or "").lower()
@@ -187,13 +303,14 @@ class DomainLimiter:
                     self._semaphores[key] = sem
             sem.acquire()
 
-        wait_s = 0.0
-        if self._min_delay_s > 0:
-            now = time.monotonic()
-            with self._lock:
-                next_allowed = self._next_allowed.get(key, 0.0)
-                wait_s = max(0.0, next_allowed - now)
-                self._next_allowed[key] = max(next_allowed, now) + self._min_delay_s
+        now = time.monotonic()
+        with self._lock:
+            next_allowed = self._next_allowed.get(key, 0.0)
+            backoff_until = self._backoff_until.get(key, 0.0)
+            wait_s = max(0.0, max(next_allowed, backoff_until) - now)
+            base = max(next_allowed, backoff_until, now)
+            if self._min_delay_s > 0:
+                self._next_allowed[key] = base + self._min_delay_s
         if wait_s > 0:
             time.sleep(wait_s)
 
@@ -597,6 +714,29 @@ def guess_title_query(ref_text: str) -> str:
     return best[:180].strip()
 
 
+def parse_ref_year(ref_text: str) -> int | None:
+    m = re.search(r"\b(19|20)\d{2}\b", ref_text)
+    if not m:
+        return None
+    try:
+        return int(m.group(0))
+    except Exception:
+        return None
+
+
+def parse_first_author_surname(ref_text: str) -> str:
+    txt = (ref_text or "").strip()
+    if not txt:
+        return ""
+    m = re.match(r"^\s*([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'`\\-]{1,40})\b", txt)
+    if m:
+        return m.group(1).lower()
+    m2 = re.search(r"\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'`\\-]{1,40})\s*,", txt)
+    if m2:
+        return m2.group(1).lower()
+    return ""
+
+
 def secondary_title_score(candidate_title: str, expected_title: str) -> float:
     def tokens(text: str) -> set[str]:
         raw = (text or "").lower()
@@ -665,9 +805,14 @@ def lookup_secondary_ranked(
     item: ReferenceItem,
     timeout: int,
     top_k: int,
+    api_limiter: DomainLimiter | None = None,
 ) -> tuple[list[str], list[str]]:
     expected = guess_title_query(item.text)
+    ref_year = parse_ref_year(item.text)
+    surname = parse_first_author_surname(item.text)
+    author_query = surname if len(surname) >= 3 else ""
     candidates: list[SecondaryLookupCandidate] = []
+    min_keep_score = 0.12
 
     def url_priority(url: str) -> int:
         u = (url or "").lower()
@@ -680,11 +825,21 @@ def lookup_secondary_ranked(
         return 2
 
     try:
-        res = session.get(
-            "https://api.crossref.org/works",
-            params={"query.bibliographic": expected, "rows": 5},
-            timeout=timeout,
-        )
+        crossref_params: dict[str, str | int] = {"query.bibliographic": expected, "rows": 5}
+        if author_query:
+            crossref_params["query.author"] = author_query
+        if ref_year:
+            crossref_params["filter"] = f"from-pub-date:{ref_year}-01-01,until-pub-date:{ref_year}-12-31"
+        sem = api_limiter.acquire("api.crossref.org") if api_limiter is not None else None
+        try:
+            res = session.get(
+                "https://api.crossref.org/works",
+                params=crossref_params,
+                timeout=timeout,
+            )
+        finally:
+            if sem is not None:
+                sem.release()
         if res.ok:
             items = res.json().get("message", {}).get("items", [])
             for it in items:
@@ -703,9 +858,28 @@ def lookup_secondary_ranked(
                         urls.append(str(link_url))
                 urls = sorted(unique_preserve_order(urls), key=url_priority)
                 if doi or urls:
+                    base = secondary_title_score(title, expected)
+                    if not title.strip() or base < min_keep_score:
+                        continue
+                    bonus = 0.0
+                    try:
+                        year_parts = (it.get("issued", {}) or {}).get("date-parts", []) or []
+                        y = int(year_parts[0][0]) if year_parts and year_parts[0] else None
+                        if ref_year and y and abs(y - ref_year) <= 0:
+                            bonus += 0.08
+                    except Exception:
+                        pass
+                    try:
+                        auth = it.get("author") or []
+                        if author_query and isinstance(auth, list) and auth:
+                            family = str((auth[0] or {}).get("family") or "").lower()
+                            if family and family == author_query:
+                                bonus += 0.06
+                    except Exception:
+                        pass
                     candidates.append(
                         SecondaryLookupCandidate(
-                            score=secondary_title_score(title, expected),
+                            score=base + bonus,
                             doi=doi,
                             urls=urls,
                         )
@@ -714,11 +888,19 @@ def lookup_secondary_ranked(
         pass
 
     try:
-        res = session.get(
-            "https://api.openalex.org/works",
-            params={"search": expected, "per-page": 5},
-            timeout=timeout,
-        )
+        openalex_params: dict[str, str | int] = {"search": expected, "per-page": 5}
+        if ref_year:
+            openalex_params["filter"] = f"publication_year:{ref_year}"
+        sem = api_limiter.acquire("api.openalex.org") if api_limiter is not None else None
+        try:
+            res = session.get(
+                "https://api.openalex.org/works",
+                params=openalex_params,
+                timeout=timeout,
+            )
+        finally:
+            if sem is not None:
+                sem.release()
         if res.ok:
             results = res.json().get("results", [])
             for row in results:
@@ -740,9 +922,27 @@ def lookup_secondary_ranked(
                     urls.append(landing)
                 urls = sorted(unique_preserve_order(urls), key=url_priority)
                 if doi or urls:
+                    base = secondary_title_score(title, expected)
+                    if not title.strip() or base < min_keep_score:
+                        continue
+                    bonus = 0.0
+                    try:
+                        y = int(row.get("publication_year") or 0) or None
+                        if ref_year and y and abs(y - ref_year) <= 0:
+                            bonus += 0.08
+                    except Exception:
+                        pass
+                    try:
+                        auths = row.get("authorships") or []
+                        if author_query and isinstance(auths, list) and auths:
+                            name = (((auths[0] or {}).get("author") or {}).get("display_name") or "")
+                            if name and author_query in name.lower().split():
+                                bonus += 0.06
+                    except Exception:
+                        pass
                     candidates.append(
                         SecondaryLookupCandidate(
-                            score=secondary_title_score(title, expected),
+                            score=base + bonus,
                             doi=doi,
                             urls=urls,
                         )
@@ -843,22 +1043,58 @@ def lookup_openalex(
     return sorted(set(found_dois)), sorted(set(found_urls))
 
 
-def iter_candidate_urls(item: ReferenceItem, use_doi: bool = True) -> Iterable[str]:
-    def normalize_candidate(url: str) -> str:
-        raw = (url or "").strip()
-        if not raw:
-            return raw
-        try:
-            p = urlparse(raw)
-            host = (p.hostname or "").lower()
-            if host == "xplorestaging.ieee.org":
-                scheme = "https"
-                netloc = "ieeexplore.ieee.org"
-                return p._replace(scheme=scheme, netloc=netloc).geturl()
-        except Exception:
-            return raw
-        return raw
+def lookup_unpaywall(
+    session: requests.Session,
+    doi: str,
+    email: str = "test@example.com",
+    timeout: int = 10,
+) -> str | None:
+    """
+    使用 Unpaywall API 查找开放获取PDF链接。
 
+    Unpaywall 是一个免费的开放获取数据库，包含合法的免费PDF链接。
+    无需登录/cookies，覆盖大量期刊。
+
+    Args:
+        session: requests.Session
+        doi: DOI字符串
+        email: 邮箱（Unpaywall要求提供，但可以是假邮箱）
+        timeout: 超时秒数
+
+    Returns:
+        开放获取PDF的URL，如果没有则返回None
+    """
+    if not doi:
+        return None
+    try:
+        url = f"https://api.unpaywall.org/v2/{quote(doi, safe='')}?email={email}"
+        res = session.get(url, timeout=timeout)
+        if not res.ok:
+            return None
+        data = res.json()
+
+        # 检查是否是开放获取
+        if data.get("is_oa"):
+            # 获取最佳OA位置
+            best_oa = data.get("best_oa_location") or {}
+            oa_url = best_oa.get("url_for_pdf") or best_oa.get("url")
+            if oa_url:
+                return oa_url
+
+        # 检查所有OA位置
+        for loc in data.get("oa_locations", []) or []:
+            oa_url = loc.get("url_for_pdf") or loc.get("url")
+            if oa_url:
+                return oa_url
+
+    except requests.RequestException:
+        pass
+    except Exception:
+        pass
+    return None
+
+
+def iter_candidate_urls(item: ReferenceItem, use_doi: bool = True) -> Iterable[str]:
     def candidate_priority(url: str) -> int:
         u = (url or "").lower()
         if "stampdf/getpdf.jsp" in u or u.endswith(".pdf") or "/content/pdf/" in u:
@@ -877,7 +1113,7 @@ def iter_candidate_urls(item: ReferenceItem, use_doi: bool = True) -> Iterable[s
     - 再尝试 DOI 解析链接（doi.org），通常会跳转到出版方页面或 PDF。
     """
     for url in sorted(item.urls, key=candidate_priority):
-        normalized = normalize_candidate(url)
+        normalized = normalize_candidate_url(url)
         if normalized:
             yield normalized
     if use_doi:
@@ -948,116 +1184,571 @@ def extract_ieee_pdf_url(html_text: str, base_url: str, arnumber: str) -> str | 
         return urljoin(base_url, m2.group(1))
     return None
 
-
-def extract_pdf_title_from_file(pdf_path: Path) -> str | None:
-    try:
-        reader = PdfReader(str(pdf_path))
-        meta = getattr(reader, "metadata", None)
-        title = None
-        if meta is not None:
-            title = getattr(meta, "title", None)
-            if not title and isinstance(meta, dict):
-                title = meta.get("/Title") or meta.get("Title")
-        if isinstance(title, str) and title.strip():
-            return title.strip()
-        if getattr(reader, "pages", None):
-            text = (reader.pages[0].extract_text() or "").strip()
-            if text:
-                for line in text.splitlines():
-                    cleaned = line.strip()
-                    if 12 <= len(cleaned) <= 240:
-                        return cleaned
-    except Exception:
+def resolve_downloads_subdir(downloads_dir: Path, subdir: str) -> Path | None:
+    name = str(subdir or "").strip()
+    if not name:
         return None
-    return None
+    d = downloads_dir / name
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
-def normalize_title_tokens(text: str) -> list[str]:
-    raw = (text or "").lower()
-    raw = re.sub(r"[\u2010-\u2015\u2212]", "-", raw)
-    raw = re.sub(r"[^a-z0-9]+", " ", raw)
-    tokens = [t for t in raw.split() if len(t) >= 3]
-    stop = {
-        "the",
-        "and",
-        "for",
-        "with",
-        "from",
-        "into",
-        "over",
-        "under",
-        "between",
-        "within",
-        "using",
-        "use",
-        "via",
-        "based",
-        "model",
-        "models",
-        "analysis",
-        "study",
-        "method",
-        "methods",
-        "approach",
-        "approaches",
-        "system",
-        "systems",
-        "paper",
-        "review",
-    }
-    return [t for t in tokens if t not in stop]
+def verify_downloaded_pdf_and_update_item(
+    *,
+    item: ReferenceItem,
+    out_file: Path,
+    downloads_dir: Path,
+    verified_dir: Path | None,
+    mismatch_dir: Path | None,
+    final_url: str,
+    candidate_url: str,
+    status_code: int,
+    content_type: str,
+    phase: str,
+    logger: DownloadLogger,
+    verify_title_threshold: float,
+    verify_weights,
+) -> bool:
+    prefix = f"{item.number:03d}"
+    expected = guess_title_query(item.text)
+    ref_year = parse_ref_year(item.text)
+    surname = parse_first_author_surname(item.text)
+    decision = verify_and_rename_pdf(
+        prefix=prefix,
+        out_file=out_file,
+        downloads_dir=downloads_dir,
+        verified_dir=verified_dir,
+        mismatch_dir=mismatch_dir,
+        expected_title=expected,
+        ref_year=ref_year,
+        surname=surname,
+        verify_title_threshold=float(verify_title_threshold),
+        verify_weights=verify_weights,
+    )
+    if decision.outcome == "downloaded_pdf":
+        item.download_status = "downloaded_pdf"
+        item.downloaded_file = decision.rel_path
+        item.note = (
+            f"{final_url} | title_match={decision.score:.3f} | title_score={decision.title_score:.3f} | line_score={decision.line_score:.3f} | year_hit={int(decision.year_hit)} | author_hit={int(decision.author_hit)}"
+        )
+        logger.add(
+            DownloadAttempt(
+                phase=phase,
+                ref_number=item.number,
+                candidate_url=candidate_url,
+                final_url=final_url,
+                status_code=int(status_code),
+                content_type=content_type,
+                outcome="downloaded_pdf",
+                waited_seconds=0.0,
+                error="",
+            )
+        )
+        return True
+    logger.add(
+        DownloadAttempt(
+            phase=phase,
+            ref_number=item.number,
+            candidate_url=candidate_url,
+            final_url=final_url,
+            status_code=int(status_code),
+            content_type=content_type,
+            outcome="pdf_title_mismatch",
+            waited_seconds=0.0,
+            error=f"score={decision.score:.3f}; title_score={decision.title_score:.3f}; line_score={decision.line_score:.3f}; year_hit={int(decision.year_hit)}; author_hit={int(decision.author_hit)}; best_line={decision.best_line[:120]}; pdf_title={decision.pdf_title[:120]}",
+        )
+    )
+    return True
 
 
-def title_match_score(pdf_title: str, expected_title: str) -> float:
-    a = set(normalize_title_tokens(pdf_title))
-    b = set(normalize_title_tokens(expected_title))
-    if not a or not b:
-        return 0.0
-    inter = len(a & b)
-    union = len(a | b)
-    if union <= 0:
-        return 0.0
-    return float(inter) / float(union)
+def collect_stream_text(first_chunk: bytes, chunks: Iterable[bytes], limit_bytes: int = 1024 * 1024 * 2) -> str:
+    buf = bytearray()
+    if first_chunk:
+        buf.extend(first_chunk[: min(len(first_chunk), 1024 * 1024)])
+    for chunk in chunks:
+        if not chunk:
+            continue
+        remaining = limit_bytes - len(buf)
+        if remaining <= 0:
+            break
+        buf.extend(chunk[:remaining])
+        if len(buf) >= limit_bytes:
+            break
+    return buf.decode("utf-8", errors="ignore")
 
 
-def sanitize_filename_component(text: str, max_len: int = 90) -> str:
-    s = (text or "").strip()
-    s = re.sub(r"[\\/:*?\"<>|\x00-\x1F]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    if len(s) > max_len:
-        s = s[:max_len].rstrip()
-    s = s.rstrip(". ")
-    return s
+def handle_springer_html(
+    *,
+    session: requests.Session,
+    item: ReferenceItem,
+    downloads_dir: Path,
+    mismatch_dir: Path | None,
+    verified_dir: Path | None,
+    timeout: int,
+    attempt: int,
+    verify_title_rename: bool,
+    verify_title_threshold: float,
+    logger: DownloadLogger,
+    phase: str,
+    seen: set[str],
+    prefix: str,
+    final_url: str,
+    first_chunk: bytes,
+    chunks: Iterable[bytes],
+) -> bool:
+    html_text = collect_stream_text(first_chunk, chunks)
+    pdf_url = extract_springer_pdf_url(html_text, base_url=final_url)
+    if not pdf_url or pdf_url in seen:
+        return False
+    seen.add(pdf_url)
+
+    pdf_response: requests.Response | None = None
+    try:
+        pdf_response = session.get(
+            pdf_url,
+            timeout=timeout,
+            stream=True,
+            allow_redirects=True,
+        )
+        if pdf_response.status_code in (408, 425, 429, 500, 502, 503, 504):
+            retry_after = parse_retry_after_seconds(pdf_response.headers.get("retry-after") or "")
+            waited_s = retry_after if retry_after is not None else min(30.0, (2.0**attempt) + random.random() * 0.25)
+            logger.add(
+                DownloadAttempt(
+                    phase=phase,
+                    ref_number=item.number,
+                    candidate_url=pdf_url,
+                    final_url=pdf_response.url or "",
+                    status_code=int(pdf_response.status_code),
+                    content_type=(pdf_response.headers.get("content-type") or ""),
+                    outcome="retry_status",
+                    waited_seconds=float(waited_s),
+                    error="",
+                )
+            )
+            time.sleep(waited_s)
+            return False
+        if not pdf_response.ok:
+            logger.add(
+                DownloadAttempt(
+                    phase=phase,
+                    ref_number=item.number,
+                    candidate_url=pdf_url,
+                    final_url=pdf_response.url or "",
+                    status_code=int(pdf_response.status_code),
+                    content_type=(pdf_response.headers.get("content-type") or ""),
+                    outcome="http_error",
+                    waited_seconds=0.0,
+                    error="",
+                )
+            )
+            return False
+
+        final_pdf_url = pdf_response.url or pdf_url
+        pdf_chunks = pdf_response.iter_content(chunk_size=1024 * 64)
+        pdf_first_chunk = b""
+        for chunk in pdf_chunks:
+            if chunk:
+                pdf_first_chunk = chunk
+                break
+        if not (pdf_first_chunk and is_probably_pdf(pdf_first_chunk)):
+            return False
+
+        out_file = downloads_dir / f"{prefix}.pdf"
+        tmp_file = downloads_dir / f"{prefix}.pdf.part"
+        try:
+            with tmp_file.open("wb") as f:
+                f.write(pdf_first_chunk)
+                for chunk in pdf_chunks:
+                    if chunk:
+                        f.write(chunk)
+            tmp_file.replace(out_file)
+            if verify_title_rename:
+                expected = guess_title_query(item.text)
+                pdf_title = extract_pdf_title_from_file(out_file) or ""
+                title_score = title_match_score(pdf_title, expected)
+                line_score, best_line = extract_pdf_best_line_score(out_file, expected)
+                page_text = extract_pdf_first_page_text(out_file).lower()
+                ref_year = parse_ref_year(item.text)
+                surname = parse_first_author_surname(item.text)
+                year_hit = bool(ref_year) and str(ref_year) in page_text
+                author_hit = bool(surname) and surname in page_text
+                score = max(title_score, line_score)
+                if ref_year and not year_hit:
+                    score = score * 0.95
+                if surname and not author_hit:
+                    score = score * 0.97
+                if score >= float(verify_title_threshold):
+                    item.download_status = "downloaded_pdf"
+                    item.downloaded_file = out_file.name
+                    item.note = final_pdf_url
+                    name_source = best_line if line_score > title_score and best_line else pdf_title
+                    name = sanitize_filename_component(name_source or expected)
+                    if name:
+                        renamed = unique_path(downloads_dir / f"{prefix} {name}.pdf")
+                        if renamed.name != out_file.name:
+                            out_file.replace(renamed)
+                            out_file = renamed
+                            item.downloaded_file = out_file.name
+                    out_file, rel_path = move_verified_pdf(out_file, downloads_dir=downloads_dir, verified_dir=verified_dir)
+                    item.downloaded_file = rel_path
+                    item.note = f"{final_pdf_url} | title_match={score:.3f} | title_score={title_score:.3f} | line_score={line_score:.3f} | year_hit={int(year_hit)} | author_hit={int(author_hit)}"
+                    logger.add(
+                        DownloadAttempt(
+                            phase=phase,
+                            ref_number=item.number,
+                            candidate_url=pdf_url,
+                            final_url=final_pdf_url,
+                            status_code=int(pdf_response.status_code),
+                            content_type=(pdf_response.headers.get("content-type") or ""),
+                            outcome="downloaded_pdf",
+                            waited_seconds=0.0,
+                            error="",
+                        )
+                    )
+                    return True
+                mismatch_file = unique_path((mismatch_dir or downloads_dir) / f"{prefix}__mismatch.pdf")
+                out_file.replace(mismatch_file)
+                logger.add(
+                    DownloadAttempt(
+                        phase=phase,
+                        ref_number=item.number,
+                        candidate_url=pdf_url,
+                        final_url=final_pdf_url,
+                        status_code=int(pdf_response.status_code),
+                        content_type=(pdf_response.headers.get("content-type") or ""),
+                        outcome="pdf_title_mismatch",
+                        waited_seconds=0.0,
+                        error=f"score={score:.3f}; title_score={title_score:.3f}; line_score={line_score:.3f}; year_hit={int(year_hit)}; author_hit={int(author_hit)}; best_line={best_line[:120]}; pdf_title={pdf_title[:120]}",
+                    )
+                )
+                return True
+
+            item.download_status = "downloaded_pdf"
+            item.downloaded_file = out_file.name
+            item.note = final_pdf_url
+            logger.add(
+                DownloadAttempt(
+                    phase=phase,
+                    ref_number=item.number,
+                    candidate_url=pdf_url,
+                    final_url=final_pdf_url,
+                    status_code=int(pdf_response.status_code),
+                    content_type=(pdf_response.headers.get("content-type") or ""),
+                    outcome="downloaded_pdf",
+                    waited_seconds=0.0,
+                    error="",
+                )
+            )
+            return True
+        finally:
+            if tmp_file.exists():
+                tmp_file.unlink(missing_ok=True)
+    finally:
+        if pdf_response is not None:
+            pdf_response.close()
 
 
-def unique_path(path: Path) -> Path:
-    if not path.exists():
-        return path
-    stem = path.stem
-    suffix = path.suffix
-    parent = path.parent
-    for i in range(2, 200):
-        candidate = parent / f"{stem}_{i}{suffix}"
-        if not candidate.exists():
-            return candidate
-    return parent / f"{stem}_{int(time.time())}{suffix}"
+def handle_ieee_html(
+    *,
+    session: requests.Session,
+    item: ReferenceItem,
+    downloads_dir: Path,
+    mismatch_dir: Path | None,
+    verified_dir: Path | None,
+    timeout: int,
+    attempt: int,
+    verify_title_rename: bool,
+    verify_title_threshold: float,
+    logger: DownloadLogger,
+    phase: str,
+    seen: set[str],
+    prefix: str,
+    final_url: str,
+    first_chunk: bytes,
+    chunks: Iterable[bytes],
+) -> bool:
+    arnumber = extract_ieee_arnumber(final_url)
+    if not arnumber:
+        return False
+    stamp_urls = [
+        f"https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber={arnumber}",
+        f"https://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber={arnumber}",
+    ]
+    for stamp_url in stamp_urls:
+        if stamp_url in seen:
+            continue
+        seen.add(stamp_url)
+        pdf_response: requests.Response | None = None
+        try:
+            pdf_response = session.get(
+                stamp_url,
+                timeout=timeout,
+                stream=True,
+                allow_redirects=True,
+            )
+            if pdf_response.status_code in (408, 425, 429, 500, 502, 503, 504):
+                retry_after = parse_retry_after_seconds(pdf_response.headers.get("retry-after") or "")
+                waited_s = retry_after if retry_after is not None else min(30.0, (2.0**attempt) + random.random() * 0.25)
+                logger.add(
+                    DownloadAttempt(
+                        phase=phase,
+                        ref_number=item.number,
+                        candidate_url=stamp_url,
+                        final_url=pdf_response.url or "",
+                        status_code=int(pdf_response.status_code),
+                        content_type=(pdf_response.headers.get("content-type") or ""),
+                        outcome="retry_status",
+                        waited_seconds=float(waited_s),
+                        error="",
+                    )
+                )
+                time.sleep(waited_s)
+                continue
+            if not pdf_response.ok:
+                logger.add(
+                    DownloadAttempt(
+                        phase=phase,
+                        ref_number=item.number,
+                        candidate_url=stamp_url,
+                        final_url=pdf_response.url or "",
+                        status_code=int(pdf_response.status_code),
+                        content_type=(pdf_response.headers.get("content-type") or ""),
+                        outcome="http_error",
+                        waited_seconds=0.0,
+                        error="",
+                    )
+                )
+                continue
 
+            stamp_final_url = pdf_response.url or stamp_url
+            pdf_chunks = pdf_response.iter_content(chunk_size=1024 * 64)
+            pdf_first_chunk = b""
+            for chunk in pdf_chunks:
+                if chunk:
+                    pdf_first_chunk = chunk
+                    break
+            if pdf_first_chunk and is_probably_pdf(pdf_first_chunk):
+                out_file = downloads_dir / f"{prefix}.pdf"
+                tmp_file = downloads_dir / f"{prefix}.pdf.part"
+                try:
+                    with tmp_file.open("wb") as f:
+                        f.write(pdf_first_chunk)
+                        for chunk in pdf_chunks:
+                            if chunk:
+                                f.write(chunk)
+                    tmp_file.replace(out_file)
+                    if verify_title_rename:
+                        expected = guess_title_query(item.text)
+                        pdf_title = extract_pdf_title_from_file(out_file) or ""
+                        title_score = title_match_score(pdf_title, expected)
+                        line_score, best_line = extract_pdf_best_line_score(out_file, expected)
+                        page_text = extract_pdf_first_page_text(out_file).lower()
+                        ref_year = parse_ref_year(item.text)
+                        surname = parse_first_author_surname(item.text)
+                        year_hit = bool(ref_year) and str(ref_year) in page_text
+                        author_hit = bool(surname) and surname in page_text
+                        score = max(title_score, line_score)
+                        if ref_year and not year_hit:
+                            score = score * 0.95
+                        if surname and not author_hit:
+                            score = score * 0.97
+                        if score >= float(verify_title_threshold):
+                            item.download_status = "downloaded_pdf"
+                            item.downloaded_file = out_file.name
+                            item.note = stamp_final_url
+                            name_source = best_line if line_score > title_score and best_line else pdf_title
+                            name = sanitize_filename_component(name_source or expected)
+                            if name:
+                                renamed = unique_path(downloads_dir / f"{prefix} {name}.pdf")
+                                if renamed.name != out_file.name:
+                                    out_file.replace(renamed)
+                                    out_file = renamed
+                                    item.downloaded_file = out_file.name
+                            out_file, rel_path = move_verified_pdf(out_file, downloads_dir=downloads_dir, verified_dir=verified_dir)
+                            item.downloaded_file = rel_path
+                            item.note = f"{stamp_final_url} | title_match={score:.3f} | title_score={title_score:.3f} | line_score={line_score:.3f} | year_hit={int(year_hit)} | author_hit={int(author_hit)}"
+                            logger.add(
+                                DownloadAttempt(
+                                    phase=phase,
+                                    ref_number=item.number,
+                                    candidate_url=stamp_url,
+                                    final_url=stamp_final_url,
+                                    status_code=int(pdf_response.status_code),
+                                    content_type=(pdf_response.headers.get("content-type") or ""),
+                                    outcome="downloaded_pdf",
+                                    waited_seconds=0.0,
+                                    error="",
+                                )
+                            )
+                            return True
+                        mismatch_file = unique_path((mismatch_dir or downloads_dir) / f"{prefix}__mismatch.pdf")
+                        out_file.replace(mismatch_file)
+                        logger.add(
+                            DownloadAttempt(
+                                phase=phase,
+                                ref_number=item.number,
+                                candidate_url=stamp_url,
+                                final_url=stamp_final_url,
+                                status_code=int(pdf_response.status_code),
+                                content_type=(pdf_response.headers.get("content-type") or ""),
+                                outcome="pdf_title_mismatch",
+                                waited_seconds=0.0,
+                                error=f"score={score:.3f}; title_score={title_score:.3f}; line_score={line_score:.3f}; year_hit={int(year_hit)}; author_hit={int(author_hit)}; best_line={best_line[:120]}; pdf_title={pdf_title[:120]}",
+                            )
+                        )
+                        return True
 
-def move_verified_pdf(out_file: Path, downloads_dir: Path, verified_dir: Path | None) -> tuple[Path, str]:
-    if verified_dir is None:
-        return out_file, out_file.name
-    verified_dir.mkdir(parents=True, exist_ok=True)
-    dest = unique_path(verified_dir / out_file.name)
-    if dest.resolve() != out_file.resolve():
-        out_file.replace(dest)
-    rel = dest.relative_to(downloads_dir).as_posix()
-    return dest, rel
+                    item.download_status = "downloaded_pdf"
+                    item.downloaded_file = out_file.name
+                    item.note = stamp_final_url
+                    logger.add(
+                        DownloadAttempt(
+                            phase=phase,
+                            ref_number=item.number,
+                            candidate_url=stamp_url,
+                            final_url=stamp_final_url,
+                            status_code=int(pdf_response.status_code),
+                            content_type=(pdf_response.headers.get("content-type") or ""),
+                            outcome="downloaded_pdf",
+                            waited_seconds=0.0,
+                            error="",
+                        )
+                    )
+                    return True
+                finally:
+                    if tmp_file.exists():
+                        tmp_file.unlink(missing_ok=True)
+
+            html_text = collect_stream_text(pdf_first_chunk, pdf_chunks)
+            direct_pdf_url = extract_ieee_pdf_url(html_text, base_url=stamp_final_url, arnumber=arnumber)
+            if direct_pdf_url and direct_pdf_url not in seen:
+                seen.add(direct_pdf_url)
+                direct_response: requests.Response | None = None
+                try:
+                    direct_response = session.get(
+                        direct_pdf_url,
+                        timeout=timeout,
+                        stream=True,
+                        allow_redirects=True,
+                    )
+                    if not direct_response.ok:
+                        continue
+                    final_pdf_url = direct_response.url or direct_pdf_url
+                    direct_chunks = direct_response.iter_content(chunk_size=1024 * 64)
+                    direct_first = b""
+                    for chunk in direct_chunks:
+                        if chunk:
+                            direct_first = chunk
+                            break
+                    if not (direct_first and is_probably_pdf(direct_first)):
+                        continue
+                    out_file = downloads_dir / f"{prefix}.pdf"
+                    tmp_file = downloads_dir / f"{prefix}.pdf.part"
+                    try:
+                        with tmp_file.open("wb") as f:
+                            f.write(direct_first)
+                            for chunk in direct_chunks:
+                                if chunk:
+                                    f.write(chunk)
+                        tmp_file.replace(out_file)
+                        if verify_title_rename:
+                            expected = guess_title_query(item.text)
+                            pdf_title = extract_pdf_title_from_file(out_file) or ""
+                            title_score = title_match_score(pdf_title, expected)
+                            line_score, best_line = extract_pdf_best_line_score(out_file, expected)
+                            page_text = extract_pdf_first_page_text(out_file).lower()
+                            ref_year = parse_ref_year(item.text)
+                            surname = parse_first_author_surname(item.text)
+                            year_hit = bool(ref_year) and str(ref_year) in page_text
+                            author_hit = bool(surname) and surname in page_text
+                            score = max(title_score, line_score)
+                            if ref_year and not year_hit:
+                                score = score * 0.95
+                            if surname and not author_hit:
+                                score = score * 0.97
+                            if score >= float(verify_title_threshold):
+                                item.download_status = "downloaded_pdf"
+                                item.downloaded_file = out_file.name
+                                item.note = final_pdf_url
+                                name_source = best_line if line_score > title_score and best_line else pdf_title
+                                name = sanitize_filename_component(name_source or expected)
+                                if name:
+                                    renamed = unique_path(downloads_dir / f"{prefix} {name}.pdf")
+                                    if renamed.name != out_file.name:
+                                        out_file.replace(renamed)
+                                        out_file = renamed
+                                        item.downloaded_file = out_file.name
+                                out_file, rel_path = move_verified_pdf(out_file, downloads_dir=downloads_dir, verified_dir=verified_dir)
+                                item.downloaded_file = rel_path
+                                item.note = f"{final_pdf_url} | title_match={score:.3f} | title_score={title_score:.3f} | line_score={line_score:.3f} | year_hit={int(year_hit)} | author_hit={int(author_hit)}"
+                                logger.add(
+                                    DownloadAttempt(
+                                        phase=phase,
+                                        ref_number=item.number,
+                                        candidate_url=direct_pdf_url,
+                                        final_url=final_pdf_url,
+                                        status_code=int(direct_response.status_code),
+                                        content_type=(direct_response.headers.get("content-type") or ""),
+                                        outcome="downloaded_pdf",
+                                        waited_seconds=0.0,
+                                        error="",
+                                    )
+                                )
+                                return True
+                            mismatch_file = unique_path((mismatch_dir or downloads_dir) / f"{prefix}__mismatch.pdf")
+                            out_file.replace(mismatch_file)
+                            logger.add(
+                                DownloadAttempt(
+                                    phase=phase,
+                                    ref_number=item.number,
+                                    candidate_url=direct_pdf_url,
+                                    final_url=final_pdf_url,
+                                    status_code=int(direct_response.status_code),
+                                    content_type=(direct_response.headers.get("content-type") or ""),
+                                    outcome="pdf_title_mismatch",
+                                    waited_seconds=0.0,
+                                    error=f"score={score:.3f}; title_score={title_score:.3f}; line_score={line_score:.3f}; year_hit={int(year_hit)}; author_hit={int(author_hit)}; best_line={best_line[:120]}; pdf_title={pdf_title[:120]}",
+                                )
+                            )
+                            return True
+
+                        item.download_status = "downloaded_pdf"
+                        item.downloaded_file = out_file.name
+                        item.note = final_pdf_url
+                        logger.add(
+                            DownloadAttempt(
+                                phase=phase,
+                                ref_number=item.number,
+                                candidate_url=direct_pdf_url,
+                                final_url=final_pdf_url,
+                                status_code=int(direct_response.status_code),
+                                content_type=(direct_response.headers.get("content-type") or ""),
+                                outcome="downloaded_pdf",
+                                waited_seconds=0.0,
+                                error="",
+                            )
+                        )
+                        return True
+                    finally:
+                        if tmp_file.exists():
+                            tmp_file.unlink(missing_ok=True)
+                finally:
+                    if direct_response is not None:
+                        direct_response.close()
+        finally:
+            if pdf_response is not None:
+                pdf_response.close()
+    return False
 
 
 def try_download(
     session: requests.Session,
     item: ReferenceItem,
     downloads_dir: Path,
+    meta_dir: Path | None,
+    landing_dir: Path | None,
+    mismatch_dir: Path | None,
     timeout: int,
     retries: int,
     use_doi: bool,
@@ -1067,6 +1758,7 @@ def try_download(
     phase: str,
     verify_title_rename: bool,
     verify_title_threshold: float,
+    verify_weights: VerifyWeights | dict | None,
     verified_dir: Path | None,
 ) -> None:
     """
@@ -1078,11 +1770,19 @@ def try_download(
     - 否则保存最终跳转的落地页 URL 到 00X_landing.url.txt。
     """
     prefix = f"{item.number:03d}"
-    meta_file = downloads_dir / f"{prefix}_meta.txt"
+    if item.download_status in {"downloaded_pdf", "saved_landing_url"} and item.downloaded_file:
+        existing = downloads_dir / item.downloaded_file
+        if existing.exists():
+            return
+    meta_file = (meta_dir or downloads_dir) / f"{prefix}_meta.txt"
     meta_file.write_text(item.text + "\n", encoding="utf-8")
 
     seen: set[str] = set()
     tried = 0
+    best_landing_url = ""
+    best_landing_candidate = ""
+    best_landing_status_code = 0
+    best_landing_content_type = ""
     for candidate in iter_candidate_urls(item, use_doi=use_doi):
         if candidate in seen:
             continue
@@ -1121,10 +1821,19 @@ def try_download(
                                 error="",
                             )
                         )
+                        domain_limiter.backoff(host, waited_s)
                         time.sleep(waited_s)
                         continue
 
                     if not response.ok:
+                        content_type = (response.headers.get("content-type") or "")
+                        if should_record_landing_url(int(response.status_code), content_type):
+                            final_url = response.url or candidate
+                            if final_url:
+                                best_landing_url = final_url
+                                best_landing_candidate = candidate
+                                best_landing_status_code = int(response.status_code)
+                                best_landing_content_type = content_type
                         logger.add(
                             DownloadAttempt(
                                 phase=phase,
@@ -1132,7 +1841,7 @@ def try_download(
                                 candidate_url=candidate,
                                 final_url=response.url or "",
                                 status_code=int(response.status_code),
-                                content_type=(response.headers.get("content-type") or ""),
+                                content_type=content_type,
                                 outcome="http_error",
                                 waited_seconds=0.0,
                                 error="",
@@ -1140,6 +1849,10 @@ def try_download(
                         )
                         continue
                     final_url = response.url or candidate
+                    if final_url:
+                        best_landing_url = final_url
+                        best_landing_candidate = candidate
+                        best_landing_status_code = int(response.status_code)
                     chunks = response.iter_content(chunk_size=1024 * 64)
                     first_chunk = b""
                     for chunk in chunks:
@@ -1159,54 +1872,24 @@ def try_download(
                                         f.write(chunk)
                             tmp_file.replace(out_file)
                             if verify_title_rename:
-                                expected = guess_title_query(item.text)
-                                pdf_title = extract_pdf_title_from_file(out_file) or ""
-                                score = title_match_score(pdf_title, expected)
-                                if score >= float(verify_title_threshold):
-                                    item.download_status = "downloaded_pdf"
-                                    item.downloaded_file = out_file.name
-                                    item.note = final_url
-                                    name = sanitize_filename_component(pdf_title or expected)
-                                    if name:
-                                        renamed = unique_path(downloads_dir / f"{prefix} {name}.pdf")
-                                        if renamed.name != out_file.name:
-                                            out_file.replace(renamed)
-                                            out_file = renamed
-                                            item.downloaded_file = out_file.name
-                                    out_file, rel_path = move_verified_pdf(out_file, downloads_dir=downloads_dir, verified_dir=verified_dir)
-                                    item.downloaded_file = rel_path
-                                    item.note = f"{final_url} | title_match={score:.3f}"
-                                    logger.add(
-                                        DownloadAttempt(
-                                            phase=phase,
-                                            ref_number=item.number,
-                                            candidate_url=candidate,
-                                            final_url=final_url,
-                                            status_code=int(response.status_code),
-                                            content_type=(response.headers.get("content-type") or ""),
-                                            outcome="downloaded_pdf",
-                                            waited_seconds=0.0,
-                                            error="",
-                                        )
-                                    )
+                                verify_downloaded_pdf_and_update_item(
+                                    item=item,
+                                    out_file=out_file,
+                                    downloads_dir=downloads_dir,
+                                    verified_dir=verified_dir,
+                                    mismatch_dir=mismatch_dir,
+                                    final_url=final_url,
+                                    candidate_url=candidate,
+                                    status_code=int(response.status_code),
+                                    content_type=(response.headers.get("content-type") or ""),
+                                    phase=phase,
+                                    logger=logger,
+                                    verify_title_threshold=float(verify_title_threshold),
+                                    verify_weights=verify_weights,
+                                )
+                                if item.download_status == "downloaded_pdf":
                                     return
-                                else:
-                                    mismatch_file = unique_path(downloads_dir / f"{prefix}__mismatch.pdf")
-                                    out_file.replace(mismatch_file)
-                                    logger.add(
-                                        DownloadAttempt(
-                                            phase=phase,
-                                            ref_number=item.number,
-                                            candidate_url=candidate,
-                                            final_url=final_url,
-                                            status_code=int(response.status_code),
-                                            content_type=(response.headers.get("content-type") or ""),
-                                            outcome="pdf_title_mismatch",
-                                            waited_seconds=0.0,
-                                            error=f"score={score:.3f}; pdf_title={pdf_title[:140]}",
-                                        )
-                                    )
-                                    break
+                                break
 
                             item.download_status = "downloaded_pdf"
                             item.downloaded_file = out_file.name
@@ -1230,433 +1913,46 @@ def try_download(
                                 tmp_file.unlink(missing_ok=True)
 
                     content_type = (response.headers.get("content-type") or "")
-                    if "text/html" in content_type.lower() and (urlparse(final_url).hostname or "").lower() == "link.springer.com":
-                        collected = bytearray()
-                        if first_chunk:
-                            collected.extend(first_chunk[:1024 * 1024])
-                        limit = 1024 * 1024 * 2
-                        for chunk in chunks:
-                            if not chunk:
-                                continue
-                            remaining = limit - len(collected)
-                            if remaining <= 0:
-                                break
-                            collected.extend(chunk[:remaining])
-                            if len(collected) >= limit:
-                                break
-                        html_text = collected.decode("utf-8", errors="ignore")
-                        pdf_url = extract_springer_pdf_url(html_text, base_url=final_url)
-                        if pdf_url and pdf_url not in seen:
-                            seen.add(pdf_url)
-                            pdf_response: requests.Response | None = None
-                            try:
-                                pdf_response = session.get(
-                                    pdf_url,
-                                    timeout=timeout,
-                                    stream=True,
-                                    allow_redirects=True,
-                                )
-                                if pdf_response.status_code in (408, 425, 429, 500, 502, 503, 504):
-                                    retry_after = parse_retry_after_seconds(pdf_response.headers.get("retry-after") or "")
-                                    waited_s = retry_after if retry_after is not None else min(30.0, (2.0**attempt) + random.random() * 0.25)
-                                    logger.add(
-                                        DownloadAttempt(
-                                            phase=phase,
-                                            ref_number=item.number,
-                                            candidate_url=pdf_url,
-                                            final_url=pdf_response.url or "",
-                                            status_code=int(pdf_response.status_code),
-                                            content_type=(pdf_response.headers.get("content-type") or ""),
-                                            outcome="retry_status",
-                                            waited_seconds=float(waited_s),
-                                            error="",
-                                        )
-                                    )
-                                    time.sleep(waited_s)
-                                elif not pdf_response.ok:
-                                    logger.add(
-                                        DownloadAttempt(
-                                            phase=phase,
-                                            ref_number=item.number,
-                                            candidate_url=pdf_url,
-                                            final_url=pdf_response.url or "",
-                                            status_code=int(pdf_response.status_code),
-                                            content_type=(pdf_response.headers.get("content-type") or ""),
-                                            outcome="http_error",
-                                            waited_seconds=0.0,
-                                            error="",
-                                        )
-                                    )
-                                else:
-                                    final_pdf_url = pdf_response.url or pdf_url
-                                    pdf_chunks = pdf_response.iter_content(chunk_size=1024 * 64)
-                                    pdf_first_chunk = b""
-                                    for chunk in pdf_chunks:
-                                        if chunk:
-                                            pdf_first_chunk = chunk
-                                            break
-                                    if pdf_first_chunk and is_probably_pdf(pdf_first_chunk):
-                                        out_file = downloads_dir / f"{prefix}.pdf"
-                                        tmp_file = downloads_dir / f"{prefix}.pdf.part"
-                                        try:
-                                            with tmp_file.open("wb") as f:
-                                                f.write(pdf_first_chunk)
-                                                for chunk in pdf_chunks:
-                                                    if chunk:
-                                                        f.write(chunk)
-                                            tmp_file.replace(out_file)
-                                            if verify_title_rename:
-                                                expected = guess_title_query(item.text)
-                                                pdf_title = extract_pdf_title_from_file(out_file) or ""
-                                                score = title_match_score(pdf_title, expected)
-                                                if score >= float(verify_title_threshold):
-                                                    item.download_status = "downloaded_pdf"
-                                                    item.downloaded_file = out_file.name
-                                                    item.note = final_pdf_url
-                                                    name = sanitize_filename_component(pdf_title or expected)
-                                                    if name:
-                                                        renamed = unique_path(downloads_dir / f"{prefix} {name}.pdf")
-                                                        if renamed.name != out_file.name:
-                                                            out_file.replace(renamed)
-                                                            out_file = renamed
-                                                            item.downloaded_file = out_file.name
-                                                    out_file, rel_path = move_verified_pdf(out_file, downloads_dir=downloads_dir, verified_dir=verified_dir)
-                                                    item.downloaded_file = rel_path
-                                                    item.note = f"{final_pdf_url} | title_match={score:.3f}"
-                                                    logger.add(
-                                                        DownloadAttempt(
-                                                            phase=phase,
-                                                            ref_number=item.number,
-                                                            candidate_url=pdf_url,
-                                                            final_url=final_pdf_url,
-                                                            status_code=int(pdf_response.status_code),
-                                                            content_type=(pdf_response.headers.get("content-type") or ""),
-                                                            outcome="downloaded_pdf",
-                                                            waited_seconds=0.0,
-                                                            error="",
-                                                        )
-                                                    )
-                                                    return
-                                                else:
-                                                    mismatch_file = unique_path(downloads_dir / f"{prefix}__mismatch.pdf")
-                                                    out_file.replace(mismatch_file)
-                                                    logger.add(
-                                                        DownloadAttempt(
-                                                            phase=phase,
-                                                            ref_number=item.number,
-                                                            candidate_url=pdf_url,
-                                                            final_url=final_pdf_url,
-                                                            status_code=int(pdf_response.status_code),
-                                                            content_type=(pdf_response.headers.get("content-type") or ""),
-                                                            outcome="pdf_title_mismatch",
-                                                            waited_seconds=0.0,
-                                                            error=f"score={score:.3f}; pdf_title={pdf_title[:140]}",
-                                                        )
-                                                    )
-                                                    break
-
-                                            item.download_status = "downloaded_pdf"
-                                            item.downloaded_file = out_file.name
-                                            item.note = final_pdf_url
-                                            logger.add(
-                                                DownloadAttempt(
-                                                    phase=phase,
-                                                    ref_number=item.number,
-                                                    candidate_url=pdf_url,
-                                                    final_url=final_pdf_url,
-                                                    status_code=int(pdf_response.status_code),
-                                                    content_type=(pdf_response.headers.get("content-type") or ""),
-                                                    outcome="downloaded_pdf",
-                                                    waited_seconds=0.0,
-                                                    error="",
-                                                )
-                                            )
-                                            return
-                                        finally:
-                                            if tmp_file.exists():
-                                                tmp_file.unlink(missing_ok=True)
-                            finally:
-                                if pdf_response is not None:
-                                    pdf_response.close()
-
-                    if "text/html" in content_type.lower() and (urlparse(final_url).hostname or "").lower() == "ieeexplore.ieee.org":
-                        arnumber = extract_ieee_arnumber(final_url)
-                        if arnumber:
-                            stamp_urls = [
-                                f"https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber={arnumber}",
-                                f"https://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber={arnumber}",
-                            ]
-                            for stamp_url in stamp_urls:
-                                if stamp_url in seen:
-                                    continue
-                                seen.add(stamp_url)
-                                pdf_response: requests.Response | None = None
-                                try:
-                                    pdf_response = session.get(
-                                        stamp_url,
-                                        timeout=timeout,
-                                        stream=True,
-                                        allow_redirects=True,
-                                    )
-                                    if pdf_response.status_code in (408, 425, 429, 500, 502, 503, 504):
-                                        retry_after = parse_retry_after_seconds(pdf_response.headers.get("retry-after") or "")
-                                        waited_s = retry_after if retry_after is not None else min(30.0, (2.0**attempt) + random.random() * 0.25)
-                                        logger.add(
-                                            DownloadAttempt(
-                                                phase=phase,
-                                                ref_number=item.number,
-                                                candidate_url=stamp_url,
-                                                final_url=pdf_response.url or "",
-                                                status_code=int(pdf_response.status_code),
-                                                content_type=(pdf_response.headers.get("content-type") or ""),
-                                                outcome="retry_status",
-                                                waited_seconds=float(waited_s),
-                                                error="",
-                                            )
-                                        )
-                                        time.sleep(waited_s)
-                                        continue
-                                    if not pdf_response.ok:
-                                        logger.add(
-                                            DownloadAttempt(
-                                                phase=phase,
-                                                ref_number=item.number,
-                                                candidate_url=stamp_url,
-                                                final_url=pdf_response.url or "",
-                                                status_code=int(pdf_response.status_code),
-                                                content_type=(pdf_response.headers.get("content-type") or ""),
-                                                outcome="http_error",
-                                                waited_seconds=0.0,
-                                                error="",
-                                            )
-                                        )
-                                        continue
-
-                                    stamp_final_url = pdf_response.url or stamp_url
-                                    pdf_chunks = pdf_response.iter_content(chunk_size=1024 * 64)
-                                    pdf_first_chunk = b""
-                                    for chunk in pdf_chunks:
-                                        if chunk:
-                                            pdf_first_chunk = chunk
-                                            break
-                                    if pdf_first_chunk and is_probably_pdf(pdf_first_chunk):
-                                        out_file = downloads_dir / f"{prefix}.pdf"
-                                        tmp_file = downloads_dir / f"{prefix}.pdf.part"
-                                        try:
-                                            with tmp_file.open("wb") as f:
-                                                f.write(pdf_first_chunk)
-                                                for chunk in pdf_chunks:
-                                                    if chunk:
-                                                        f.write(chunk)
-                                            tmp_file.replace(out_file)
-                                            if verify_title_rename:
-                                                expected = guess_title_query(item.text)
-                                                pdf_title = extract_pdf_title_from_file(out_file) or ""
-                                                score = title_match_score(pdf_title, expected)
-                                                if score >= float(verify_title_threshold):
-                                                    item.download_status = "downloaded_pdf"
-                                                    item.downloaded_file = out_file.name
-                                                    item.note = stamp_final_url
-                                                    name = sanitize_filename_component(pdf_title or expected)
-                                                    if name:
-                                                        renamed = unique_path(downloads_dir / f"{prefix} {name}.pdf")
-                                                        if renamed.name != out_file.name:
-                                                            out_file.replace(renamed)
-                                                            out_file = renamed
-                                                            item.downloaded_file = out_file.name
-                                                    out_file, rel_path = move_verified_pdf(out_file, downloads_dir=downloads_dir, verified_dir=verified_dir)
-                                                    item.downloaded_file = rel_path
-                                                    item.note = f"{stamp_final_url} | title_match={score:.3f}"
-                                                    logger.add(
-                                                        DownloadAttempt(
-                                                            phase=phase,
-                                                            ref_number=item.number,
-                                                            candidate_url=stamp_url,
-                                                            final_url=stamp_final_url,
-                                                            status_code=int(pdf_response.status_code),
-                                                            content_type=(pdf_response.headers.get("content-type") or ""),
-                                                            outcome="downloaded_pdf",
-                                                            waited_seconds=0.0,
-                                                            error="",
-                                                        )
-                                                    )
-                                                    return
-                                                mismatch_file = unique_path(downloads_dir / f"{prefix}__mismatch.pdf")
-                                                out_file.replace(mismatch_file)
-                                                logger.add(
-                                                    DownloadAttempt(
-                                                        phase=phase,
-                                                        ref_number=item.number,
-                                                        candidate_url=stamp_url,
-                                                        final_url=stamp_final_url,
-                                                        status_code=int(pdf_response.status_code),
-                                                        content_type=(pdf_response.headers.get("content-type") or ""),
-                                                        outcome="pdf_title_mismatch",
-                                                        waited_seconds=0.0,
-                                                        error=f"score={score:.3f}; pdf_title={pdf_title[:140]}",
-                                                    )
-                                                )
-                                                break
-
-                                            item.download_status = "downloaded_pdf"
-                                            item.downloaded_file = out_file.name
-                                            item.note = stamp_final_url
-                                            logger.add(
-                                                DownloadAttempt(
-                                                    phase=phase,
-                                                    ref_number=item.number,
-                                                    candidate_url=stamp_url,
-                                                    final_url=stamp_final_url,
-                                                    status_code=int(pdf_response.status_code),
-                                                    content_type=(pdf_response.headers.get("content-type") or ""),
-                                                    outcome="downloaded_pdf",
-                                                    waited_seconds=0.0,
-                                                    error="",
-                                                )
-                                            )
-                                            return
-                                        finally:
-                                            if tmp_file.exists():
-                                                tmp_file.unlink(missing_ok=True)
-
-                                    html_bytes = bytearray()
-                                    if pdf_first_chunk:
-                                        html_bytes.extend(pdf_first_chunk[:1024 * 1024])
-                                    limit = 1024 * 1024 * 2
-                                    for chunk in pdf_chunks:
-                                        if not chunk:
-                                            continue
-                                        remaining = limit - len(html_bytes)
-                                        if remaining <= 0:
-                                            break
-                                        html_bytes.extend(chunk[:remaining])
-                                        if len(html_bytes) >= limit:
-                                            break
-                                    html_text = html_bytes.decode("utf-8", errors="ignore")
-                                    direct_pdf_url = extract_ieee_pdf_url(html_text, base_url=stamp_final_url, arnumber=arnumber)
-                                    if direct_pdf_url and direct_pdf_url not in seen:
-                                        seen.add(direct_pdf_url)
-                                        direct_response: requests.Response | None = None
-                                        try:
-                                            direct_response = session.get(
-                                                direct_pdf_url,
-                                                timeout=timeout,
-                                                stream=True,
-                                                allow_redirects=True,
-                                            )
-                                            if not direct_response.ok:
-                                                continue
-                                            final_pdf_url = direct_response.url or direct_pdf_url
-                                            direct_chunks = direct_response.iter_content(chunk_size=1024 * 64)
-                                            direct_first = b""
-                                            for chunk in direct_chunks:
-                                                if chunk:
-                                                    direct_first = chunk
-                                                    break
-                                            if direct_first and is_probably_pdf(direct_first):
-                                                out_file = downloads_dir / f"{prefix}.pdf"
-                                                tmp_file = downloads_dir / f"{prefix}.pdf.part"
-                                                try:
-                                                    with tmp_file.open("wb") as f:
-                                                        f.write(direct_first)
-                                                        for chunk in direct_chunks:
-                                                            if chunk:
-                                                                f.write(chunk)
-                                                    tmp_file.replace(out_file)
-                                                    if verify_title_rename:
-                                                        expected = guess_title_query(item.text)
-                                                        pdf_title = extract_pdf_title_from_file(out_file) or ""
-                                                        score = title_match_score(pdf_title, expected)
-                                                        if score >= float(verify_title_threshold):
-                                                            item.download_status = "downloaded_pdf"
-                                                            item.downloaded_file = out_file.name
-                                                            item.note = final_pdf_url
-                                                            name = sanitize_filename_component(pdf_title or expected)
-                                                            if name:
-                                                                renamed = unique_path(downloads_dir / f"{prefix} {name}.pdf")
-                                                                if renamed.name != out_file.name:
-                                                                    out_file.replace(renamed)
-                                                                    out_file = renamed
-                                                                    item.downloaded_file = out_file.name
-                                                            out_file, rel_path = move_verified_pdf(out_file, downloads_dir=downloads_dir, verified_dir=verified_dir)
-                                                            item.downloaded_file = rel_path
-                                                            item.note = f"{final_pdf_url} | title_match={score:.3f}"
-                                                            logger.add(
-                                                                DownloadAttempt(
-                                                                    phase=phase,
-                                                                    ref_number=item.number,
-                                                                    candidate_url=direct_pdf_url,
-                                                                    final_url=final_pdf_url,
-                                                                    status_code=int(direct_response.status_code),
-                                                                    content_type=(direct_response.headers.get("content-type") or ""),
-                                                                    outcome="downloaded_pdf",
-                                                                    waited_seconds=0.0,
-                                                                    error="",
-                                                                )
-                                                            )
-                                                            return
-                                                        mismatch_file = unique_path(downloads_dir / f"{prefix}__mismatch.pdf")
-                                                        out_file.replace(mismatch_file)
-                                                        logger.add(
-                                                            DownloadAttempt(
-                                                                phase=phase,
-                                                                ref_number=item.number,
-                                                                candidate_url=direct_pdf_url,
-                                                                final_url=final_pdf_url,
-                                                                status_code=int(direct_response.status_code),
-                                                                content_type=(direct_response.headers.get("content-type") or ""),
-                                                                outcome="pdf_title_mismatch",
-                                                                waited_seconds=0.0,
-                                                                error=f"score={score:.3f}; pdf_title={pdf_title[:140]}",
-                                                            )
-                                                        )
-                                                    else:
-                                                        item.download_status = "downloaded_pdf"
-                                                        item.downloaded_file = out_file.name
-                                                        item.note = final_pdf_url
-                                                        logger.add(
-                                                            DownloadAttempt(
-                                                                phase=phase,
-                                                                ref_number=item.number,
-                                                                candidate_url=direct_pdf_url,
-                                                                final_url=final_pdf_url,
-                                                                status_code=int(direct_response.status_code),
-                                                                content_type=(direct_response.headers.get("content-type") or ""),
-                                                                outcome="downloaded_pdf",
-                                                                waited_seconds=0.0,
-                                                                error="",
-                                                            )
-                                                        )
-                                                        return
-                                                finally:
-                                                    if tmp_file.exists():
-                                                        tmp_file.unlink(missing_ok=True)
-                                        finally:
-                                            if direct_response is not None:
-                                                direct_response.close()
-                                finally:
-                                    if pdf_response is not None:
-                                        pdf_response.close()
-
-                    landing_file = downloads_dir / f"{prefix}_landing.url.txt"
-                    landing_file.write_text(final_url + "\n", encoding="utf-8")
-                    item.download_status = "saved_landing_url"
-                    item.downloaded_file = landing_file.name
-                    item.note = final_url
-                    logger.add(
-                        DownloadAttempt(
+                    best_landing_content_type = content_type
+                    if "text/html" in content_type.lower():
+                        host = (urlparse(final_url).hostname or "").lower()
+                        helpers = {
+                            "parse_retry_after_seconds": parse_retry_after_seconds,
+                            "is_probably_pdf": is_probably_pdf,
+                            "verify_downloaded_pdf_and_update_item": verify_downloaded_pdf_and_update_item,
+                            "extract_springer_pdf_url": extract_springer_pdf_url,
+                            "extract_ieee_arnumber": extract_ieee_arnumber,
+                            "extract_ieee_pdf_url": extract_ieee_pdf_url,
+                            "DownloadAttempt": DownloadAttempt,
+                        }
+                        handler_result = site_handlers.dispatch_html(
+                            host=host,
+                            session=session,
+                            item=item,
+                            helpers=helpers,
+                            downloads_dir=downloads_dir,
+                            mismatch_dir=mismatch_dir,
+                            verified_dir=verified_dir,
+                            timeout=timeout,
+                            attempt=attempt,
+                            verify_title_rename=verify_title_rename,
+                            verify_title_threshold=float(verify_title_threshold),
+                            verify_weights=verify_weights,
+                            logger=logger,
                             phase=phase,
-                            ref_number=item.number,
-                            candidate_url=candidate,
+                            seen=seen,
+                            prefix=prefix,
                             final_url=final_url,
-                            status_code=int(response.status_code),
-                            content_type=content_type,
-                            outcome="saved_landing_url",
-                            waited_seconds=0.0,
-                            error="",
+                            first_chunk=first_chunk,
+                            chunks=chunks,
                         )
-                    )
-                    return
+                        if handler_result == "downloaded":
+                            return
+                        if handler_result == "retry":
+                            continue
+                        break
+
+                    break
                 finally:
                     if response is not None:
                         response.close()
@@ -1676,8 +1972,31 @@ def try_download(
                         error=str(e),
                     )
                 )
+                domain_limiter.backoff(urlparse(candidate).hostname or "", waited_s)
                 time.sleep(waited_s)
                 continue
+
+    if best_landing_url:
+        landing_base = landing_dir or downloads_dir
+        landing_file = landing_base / f"{prefix}_landing.url.txt"
+        landing_file.write_text(best_landing_url + "\n", encoding="utf-8")
+        item.download_status = "saved_landing_url"
+        item.downloaded_file = landing_file.relative_to(downloads_dir).as_posix() if landing_base != downloads_dir else landing_file.name
+        item.note = best_landing_url
+        logger.add(
+            DownloadAttempt(
+                phase=phase,
+                ref_number=item.number,
+                candidate_url=best_landing_candidate or "",
+                final_url=best_landing_url,
+                status_code=int(best_landing_status_code),
+                content_type=best_landing_content_type,
+                outcome="saved_landing_url",
+                waited_seconds=0.0,
+                error="",
+            )
+        )
+        return
 
     item.download_status = "failed"
     item.note = "No reachable URL/DOI PDF or landing page."
@@ -1686,6 +2005,9 @@ def try_download(
 def run_initial_download_phase(
     refs: list[ReferenceItem],
     downloads_dir: Path,
+    meta_dir: Path | None,
+    landing_dir: Path | None,
+    mismatch_dir: Path | None,
     timeout: int,
     retries: int,
     use_doi: bool,
@@ -1699,7 +2021,9 @@ def run_initial_download_phase(
     cookies_jar: MozillaCookieJar | None,
     verify_title_rename: bool,
     verify_title_threshold: float,
+    verify_weights: VerifyWeights | dict | None,
     verified_dir: Path | None,
+    domain_cookies: dict[str, MozillaCookieJar] | None = None,
 ) -> None:
     """
     初次下载阶段：并发尝试每条参考文献的候选链接。
@@ -1707,21 +2031,48 @@ def run_initial_download_phase(
     关键点：
     - 使用 thread_local 为每个线程保存一个 Session，实现连接复用；
     - show_progress 为 True 且安装 tqdm 时，会显示进度条。
+    - domain_cookies: 按域名配置的cookies，优先于全局cookies使用
     """
     if not refs:
         return
 
     thread_local = threading.local()
     domain_limiter = DomainLimiter(max_per_domain, min_delay_ms=min_domain_delay_ms)
+    domain_cookies = domain_cookies or {}
 
-    def worker(item: ReferenceItem) -> None:
-        # 每个线程只初始化一次 Session，降低 TLS 握手与连接创建开销。
+    def get_session_for_item(item: ReferenceItem) -> requests.Session:
+        """根据item的URL/DOI域名选择合适的session"""
+        # 检查item的URLs和DOIs，找到匹配的域名cookies
+        from urllib.parse import urlparse
+        for url in item.urls:
+            host = urlparse(url).hostname or ""
+            host_lower = host.lower()
+            # 检查是否有直接匹配的域名cookies
+            if host_lower in domain_cookies:
+                if not hasattr(thread_local, "domain_sessions"):
+                    thread_local.domain_sessions = {}
+                if host_lower not in thread_local.domain_sessions:
+                    thread_local.domain_sessions[host_lower] = make_session(
+                        pool_size=max(8, workers * 2),
+                        user_agent=user_agent,
+                        cookies_jar=domain_cookies[host_lower],
+                    )
+                return thread_local.domain_sessions[host_lower]
+        # 使用默认session
         if not hasattr(thread_local, "session"):
             thread_local.session = make_session(pool_size=max(8, workers * 2), user_agent=user_agent, cookies_jar=cookies_jar)
+        return thread_local.session
+
+    def worker(item: ReferenceItem) -> None:
+        # 根据item的域名选择合适的session
+        session = get_session_for_item(item)
         try_download(
-            session=thread_local.session,
+            session=session,
             item=item,
             downloads_dir=downloads_dir,
+            meta_dir=meta_dir,
+            landing_dir=landing_dir,
+            mismatch_dir=mismatch_dir,
             timeout=timeout,
             retries=retries,
             use_doi=use_doi,
@@ -1731,6 +2082,7 @@ def run_initial_download_phase(
             phase="initial",
             verify_title_rename=verify_title_rename,
             verify_title_threshold=verify_title_threshold,
+            verify_weights=verify_weights,
             verified_dir=verified_dir,
         )
 
@@ -1749,6 +2101,9 @@ def enrich_failed_references(
     lookup_timeout: int,
     retries: int,
     downloads_dir: Path,
+    meta_dir: Path | None,
+    landing_dir: Path | None,
+    mismatch_dir: Path | None,
     max_items: int,
     max_candidates_per_item: int,
     secondary_top_k: int,
@@ -1761,7 +2116,10 @@ def enrich_failed_references(
     cookies_jar: MozillaCookieJar | None,
     verify_title_rename: bool,
     verify_title_threshold: float,
+    verify_weights: VerifyWeights | dict | None,
     verified_dir: Path | None,
+    secondary_cache: SecondaryLookupCache | None,
+    unpaywall_email: str = "",
 ) -> None:
     """
     二次检索阶段：对初次下载失败的条目调用 Crossref/OpenAlex 补全 DOI/URL，再重试下载。
@@ -1778,19 +2136,98 @@ def enrich_failed_references(
 
     thread_local = threading.local()
     domain_limiter = DomainLimiter(max_per_domain, min_delay_ms=min_domain_delay_ms)
+    api_limiter = DomainLimiter(1, min_delay_ms=max(500, min_domain_delay_ms))
 
     def worker(item: ReferenceItem) -> None:
         if not hasattr(thread_local, "session"):
             thread_local.session = make_session(pool_size=max(8, workers * 2), user_agent=user_agent, cookies_jar=cookies_jar)
         session = thread_local.session
-        secondary_dois, secondary_urls = lookup_secondary_ranked(session, item=item, timeout=lookup_timeout, top_k=secondary_top_k)
+        cache_key = hashlib.sha1(
+            json.dumps(
+                {
+                    "v": 2,
+                    "q": guess_title_query(item.text),
+                    "y": parse_ref_year(item.text),
+                    "a": parse_first_author_surname(item.text),
+                    "k": int(secondary_top_k),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        cached = secondary_cache.get(cache_key) if secondary_cache is not None else None
+        if cached is not None:
+            secondary_dois, secondary_urls = cached
+        else:
+            secondary_dois, secondary_urls = lookup_secondary_ranked(
+                session,
+                item=item,
+                timeout=lookup_timeout,
+                top_k=secondary_top_k,
+                api_limiter=api_limiter,
+            )
+            if secondary_cache is not None:
+                secondary_cache.set(cache_key, secondary_dois, secondary_urls)
         item.dois = unique_preserve_order(list(item.dois) + list(secondary_dois))
         item.urls = unique_preserve_order(list(item.urls) + list(secondary_urls))
+
+        # 尝试Unpaywall获取开放获取PDF，并记录可观测事件
+        if unpaywall_email:
+            for doi in item.dois:
+                oa_url = lookup_unpaywall(session, doi, email=unpaywall_email, timeout=lookup_timeout)
+                api_url = f"https://api.unpaywall.org/v2/{quote(doi, safe='')}"
+                if oa_url:
+                    logger.add(
+                        DownloadAttempt(
+                            phase="secondary",
+                            ref_number=item.number,
+                            candidate_url=api_url,
+                            final_url=oa_url,
+                            status_code=0,
+                            content_type="",
+                            outcome="unpaywall_candidate",
+                            waited_seconds=0.0,
+                            error="",
+                        )
+                    )
+                    if oa_url not in item.urls:
+                        item.urls = unique_preserve_order(list(item.urls) + [oa_url])
+                        logger.add(
+                            DownloadAttempt(
+                                phase="secondary",
+                                ref_number=item.number,
+                                candidate_url=oa_url,
+                                final_url="",
+                                status_code=0,
+                                content_type="",
+                                outcome="unpaywall_injected",
+                                waited_seconds=0.0,
+                                error="",
+                            )
+                        )
+                else:
+                    logger.add(
+                        DownloadAttempt(
+                            phase="secondary",
+                            ref_number=item.number,
+                            candidate_url=api_url,
+                            final_url="",
+                            status_code=0,
+                            content_type="",
+                            outcome="unpaywall_miss",
+                            waited_seconds=0.0,
+                            error="",
+                        )
+                    )
+
         if item.dois or item.urls:
             try_download(
                 session=session,
                 item=item,
                 downloads_dir=downloads_dir,
+                meta_dir=meta_dir,
+                landing_dir=landing_dir,
+                mismatch_dir=mismatch_dir,
                 timeout=timeout,
                 retries=retries,
                 use_doi=True,
@@ -1800,6 +2237,7 @@ def enrich_failed_references(
                 phase="secondary",
                 verify_title_rename=verify_title_rename,
                 verify_title_threshold=verify_title_threshold,
+                verify_weights=verify_weights,
                 verified_dir=verified_dir,
             )
             if item.download_status != "failed":
@@ -1812,6 +2250,8 @@ def enrich_failed_references(
             iterator = tqdm(iterator, total=len(futures), desc="Secondary lookup")
         for _ in iterator:
             pass
+    if secondary_cache is not None:
+        secondary_cache.flush()
 
 
 def write_outputs(refs: list[ReferenceItem], output_dir: Path) -> None:
@@ -1859,6 +2299,68 @@ def write_outputs(refs: list[ReferenceItem], output_dir: Path) -> None:
             writer.writerow(row)
 
 
+def load_domain_cookies_config(path: Path) -> dict[str, dict]:
+    """
+    加载域名cookies配置文件
+
+    Returns:
+        {"domain": {"cookies_path": "...", "description": "..."}}
+    """
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        # 支持 {"domains": {...}} 和直接 {"domain": {...}} 两种格式
+        if isinstance(data, dict):
+            if "domains" in data:
+                return data.get("domains", {})
+            return {k: v for k, v in data.items() if isinstance(v, dict) and "cookies_path" in v}
+    except Exception:
+        pass
+    return {}
+
+
+def save_domain_cookies_config(config: dict[str, dict], path: Path) -> None:
+    """保存域名cookies配置到文件"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "version": 1,
+        "domains": config,
+    }
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_domain_cookies(
+    domain_config: dict[str, dict],
+    base_dir: Path | None = None,
+) -> dict[str, "MozillaCookieJar"]:
+    """
+    加载每个域名的cookies
+
+    Args:
+        domain_config: {"domain": {"cookies_path": "..."}}
+        base_dir: cookies路径的基准目录
+
+    Returns:
+        {"domain": MozillaCookieJar}
+    """
+    result: dict[str, MozillaCookieJar] = {}
+    for domain, cfg in domain_config.items():
+        cookies_path = cfg.get("cookies_path")
+        if not cookies_path:
+            continue
+        path = Path(cookies_path)
+        if not path.is_absolute() and base_dir:
+            path = base_dir / path
+        if path.exists():
+            try:
+                jar = load_cookies_txt(path)
+                result[domain] = jar
+            except Exception:
+                pass
+    return result
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """构建命令行参数解析器（CLI）。"""
     parser = argparse.ArgumentParser(
@@ -1882,13 +2384,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cookies", help="cookies.txt (Netscape) path for authenticated downloads")
     parser.add_argument("--verify-title-rename", action="store_true", help="Verify downloaded PDF title and rename on match")
     parser.add_argument("--verify-title-threshold", type=float, default=0.55, help="Title match threshold (Jaccard)")
+    parser.add_argument("--verify-title-weight", type=float, default=1.0, help="Verify score: weight for PDF title match")
+    parser.add_argument("--verify-line-weight", type=float, default=1.0, help="Verify score: weight for first-page best line match")
+    parser.add_argument("--verify-year-hit-bonus", type=float, default=0.0, help="Verify score: add bonus when year appears on first page")
+    parser.add_argument("--verify-year-miss-mult", type=float, default=0.95, help="Verify score: multiply when year missing on first page")
+    parser.add_argument("--verify-author-hit-bonus", type=float, default=0.0, help="Verify score: add bonus when author surname appears on first page")
+    parser.add_argument("--verify-author-miss-mult", type=float, default=0.97, help="Verify score: multiply when author surname missing on first page")
     parser.add_argument("--verified-subdir", default="verified_pdfs", help="Put verified PDFs into downloads/<subdir> (empty disables)")
+    parser.add_argument("--meta-subdir", default="meta", help="Put meta txt files into downloads/<subdir> (empty disables)")
+    parser.add_argument("--landing-subdir", default="landing_urls", help="Put landing url txt files into downloads/<subdir> (empty disables)")
+    parser.add_argument("--mismatch-subdir", default="mismatch_pdfs", help="Put mismatched PDFs into downloads/<subdir> (empty disables)")
     parser.add_argument("--workers", type=int, default=8, help="Concurrent worker count")
     parser.add_argument("--max-per-domain", type=int, default=2, help="Max concurrent requests per domain (0 means unlimited)")
     parser.add_argument("--min-domain-delay-ms", type=int, default=0, help="Minimum delay per domain between requests")
     parser.add_argument("--user-agent", default="ReferenceDownloader/1.1", help="HTTP User-Agent header")
     parser.add_argument("--download-log", default="download_log.csv", help="Write download attempt log CSV (empty to disable)")
+    parser.add_argument("--unpaywall-email", default="", help="Your email for Unpaywall API (required for OA lookup)")
     parser.add_argument("--no-progress", action="store_true", help="Disable progress bars")
+    resume_group = parser.add_mutually_exclusive_group()
+    resume_group.add_argument("--resume", dest="resume", action="store_true", help="Resume using existing output directory state")
+    resume_group.add_argument("--no-resume", dest="resume", action="store_false", help="Disable resume behavior")
+    parser.set_defaults(resume=True)
 
     parser.add_argument(
         "--max-candidates-per-item",
@@ -1913,7 +2429,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--secondary-max", type=int, default=40, help="Secondary phase max failed items")
     parser.add_argument("--secondary-top-k", type=int, default=2, help="Secondary lookup: keep top K title-similar candidates (0 means all)")
+    parser.add_argument("--secondary-cache", default="cache/secondary_lookup_cache.json", help="Secondary lookup cache file (relative to output; empty disables)")
     parser.add_argument("--no-download", action="store_true", help="Only extract and number references")
+
+    # 域名cookies配置
+    parser.add_argument("--domain-cookies-file", default="domain_cookies.json", help="Per-domain cookies config file")
+    parser.add_argument(
+        "--interactive",
+        choices=["auto", "true", "false"],
+        default="auto",
+        help="Interactive mode: auto (detect TTY), true, or false (batch mode)",
+    )
     return parser
 
 
@@ -1947,9 +2473,20 @@ def main() -> None:
     input_pdf = Path(args.input)
     output_dir = Path(args.output)
     downloads_dir = output_dir / "downloads"
+    meta_dir = resolve_downloads_subdir(downloads_dir, str(getattr(args, "meta_subdir", "meta")))
+    landing_dir = resolve_downloads_subdir(downloads_dir, str(getattr(args, "landing_subdir", "landing_urls")))
+    mismatch_dir = resolve_downloads_subdir(downloads_dir, str(getattr(args, "mismatch_subdir", "mismatch_pdfs")))
     verified_dir: Path | None = None
-    if bool(args.verify_title_rename) and str(getattr(args, "verified_subdir", "")).strip():
-        verified_dir = downloads_dir / str(args.verified_subdir).strip()
+    if bool(args.verify_title_rename):
+        verified_dir = resolve_downloads_subdir(downloads_dir, str(getattr(args, "verified_subdir", "verified_pdfs")))
+    verify_weights = VerifyWeights(
+        title_weight=float(getattr(args, "verify_title_weight", 1.0)),
+        line_weight=float(getattr(args, "verify_line_weight", 1.0)),
+        year_hit_bonus=float(getattr(args, "verify_year_hit_bonus", 0.0)),
+        year_miss_multiplier=float(getattr(args, "verify_year_miss_mult", 0.95)),
+        author_hit_bonus=float(getattr(args, "verify_author_hit_bonus", 0.0)),
+        author_miss_multiplier=float(getattr(args, "verify_author_miss_mult", 0.97)),
+    )
 
     if not input_pdf.exists():
         raise FileNotFoundError(f"Input PDF does not exist: {input_pdf}")
@@ -1965,15 +2502,59 @@ def main() -> None:
     ref_section = extract_references_section(full_text)
     refs = split_references(ref_section)
 
+    # 3) 域名分析与交互式配置
+    from site_handlers.domain_analyzer import analyze_reference_domains
+    from interactive_ui import should_run_interactive, display_domain_summary, configure_cookies_interactively
+
+    # 加载域名cookies配置
+    domain_cookies_file = Path(getattr(args, "domain_cookies_file", "domain_cookies.json"))
+    if not domain_cookies_file.is_absolute():
+        domain_cookies_file = output_dir / domain_cookies_file
+    domain_cookies_config = load_domain_cookies_config(domain_cookies_file)
+
+    # 分析域名
+    domain_info = analyze_reference_domains(refs, domain_cookies_config)
+
+    # 显示域名摘要（始终显示）
+    display_domain_summary(domain_info)
+
+    # 检测是否应该进入交互模式
+    interactive_setting = str(getattr(args, "interactive", "auto"))
+    is_interactive = should_run_interactive(interactive_setting)
+
+    if is_interactive:
+        # 交互式配置cookies
+        new_config = configure_cookies_interactively(domain_info, domain_cookies_config)
+        if new_config != domain_cookies_config:
+            domain_cookies_config = new_config
+            # 保存配置
+            save_domain_cookies_config(domain_cookies_config, domain_cookies_file)
+            print(f"\n已保存域名cookies配置到: {domain_cookies_file}")
+
+    # 加载域名cookies
+    domain_cookies = load_domain_cookies(domain_cookies_config, Path.cwd())
+
     output_dir.mkdir(parents=True, exist_ok=True)
     downloads_dir.mkdir(parents=True, exist_ok=True)
+    if bool(getattr(args, "resume", True)):
+        apply_resume_state(refs, output_dir=output_dir, downloads_dir=downloads_dir)
 
     if not args.no_download:
         logger = DownloadLogger()
+        secondary_cache: SecondaryLookupCache | None = None
+        cache_str = str(getattr(args, "secondary_cache", "") or "").strip()
+        if cache_str:
+            cache_path = Path(cache_str)
+            if not cache_path.is_absolute():
+                cache_path = output_dir / cache_path
+            secondary_cache = SecondaryLookupCache(cache_path)
         initial_refs = refs[: args.download_max] if args.download_max > 0 else refs
         run_initial_download_phase(
             initial_refs,
             downloads_dir=downloads_dir,
+            meta_dir=meta_dir,
+            landing_dir=landing_dir,
+            mismatch_dir=mismatch_dir,
             timeout=args.timeout,
             retries=args.retries,
             use_doi=not args.skip_doi,
@@ -1987,7 +2568,9 @@ def main() -> None:
             cookies_jar=cookies_jar,
             verify_title_rename=bool(args.verify_title_rename),
             verify_title_threshold=float(args.verify_title_threshold),
+            verify_weights=verify_weights,
             verified_dir=verified_dir,
+            domain_cookies=domain_cookies,
         )
         if args.secondary_lookup:
             # 4) 二次检索：只针对失败项补全 DOI/URL 再下载
@@ -1998,6 +2581,9 @@ def main() -> None:
                 lookup_timeout=args.lookup_timeout,
                 retries=args.retries,
                 downloads_dir=downloads_dir,
+                meta_dir=meta_dir,
+                landing_dir=landing_dir,
+                mismatch_dir=mismatch_dir,
                 max_items=args.secondary_max,
                 max_candidates_per_item=args.max_candidates_per_item,
                 secondary_top_k=int(args.secondary_top_k),
@@ -2010,7 +2596,10 @@ def main() -> None:
                 cookies_jar=cookies_jar,
                 verify_title_rename=bool(args.verify_title_rename),
                 verify_title_threshold=float(args.verify_title_threshold),
+                verify_weights=verify_weights,
                 verified_dir=verified_dir,
+                secondary_cache=secondary_cache,
+                unpaywall_email=str(getattr(args, "unpaywall_email", "") or ""),
             )
         if args.download_log:
             logger.write_csv(output_dir / args.download_log)

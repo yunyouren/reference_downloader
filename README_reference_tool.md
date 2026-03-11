@@ -69,9 +69,17 @@ python reference_tool.py --input "你的论文.pdf" --output references_output -
 - `--max-candidates-per-item`：每条最多尝试多少链接
 - `--download-max`：最多尝试下载多少条（`--initial-max` 仍可用）
 - `--cookies`：cookies.txt（Netscape）路径，用于复用登录态
+- `--verify-title-rename`：下载后读取 PDF 标题做匹配校验，命中则按标题重命名
+- `--verify-title-threshold`：校验阈值（0~1）
+- `--verify-title-weight/--verify-line-weight`：校验打分权重
+- `--verify-year-hit-bonus/--verify-author-hit-bonus`：年份/作者命中加分
+- `--verify-year-miss-mult/--verify-author-miss-mult`：年份/作者未命中乘法惩罚
 - `--secondary-lookup`：失败项二次检索
 - `--secondary-max`：二次检索最多处理多少条失败项
+- `--secondary-cache`：二次检索缓存文件（相对 output 目录）
+- `--resume/--no-resume`：断点续跑（复用已有 `references.json` 与已下载文件）
 - `--download-log`：下载尝试日志（CSV，传空字符串可禁用）
+- `--meta-subdir/--landing-subdir/--mismatch-subdir/--verified-subdir`：downloads 子目录名（空字符串禁用）
 
 ## 输出文件
 `references_output/` 下：
@@ -79,6 +87,29 @@ python reference_tool.py --input "你的论文.pdf" --output references_output -
 - `references.csv`：结构化表格（含状态）
 - `references.json`：结构化 JSON
 - `downloads/`：
-  - `001_meta.txt`：条目原文
-  - `001.pdf`：下载到的 PDF
-  - `001_landing.url.txt`：落地页链接
+  - `meta/001_meta.txt`：条目原文
+  - `verified_pdfs/001 ... .pdf`：校验通过的 PDF
+  - `mismatch_pdfs/001__mismatch.pdf`：校验不通过的 PDF（会继续尝试其他候选）
+  - `landing_urls/001_landing.url.txt`：落地页链接
+  - `cache/secondary_lookup_cache.json`：二次检索缓存（默认）
+
+## 站点扩展（新增/修改站点逻辑）
+站点相关的 HTML 解析与跳转处理放在 `site_handlers/` 目录中：
+- `site_handlers/springer.py`
+- `site_handlers/ieee.py`
+
+新增站点时，按现有文件写一个 handler 并注册 host 即可。
+
+## 目录结构（简要）
+- `reference_tool.py`：命令行入口与主流程（解析→下载→二次检索→导出）
+- `core/`：可复用的核心工具
+  - `core/http.py`：HTTP 相关工具（`is_probably_pdf`、`parse_retry_after_seconds`）
+  - `core/html.py`：站点 HTML 解析工具（如 Springer/IEEE PDF 链接提取）
+- `site_handlers/`：站点适配器（HTML 落地页到直链的解析与下载）
+  - `registry.py`：handler 注册与分发
+  - `springer.py`、`ieee.py`：已适配示例
+- `tests/`：最小单元测试
+  - `test_core.py`：核心逻辑基础校验
+  - `test_html_parsers.py`：站点 HTML 解析校验
+
+说明：handler 与主流程通过“helpers”解耦，站点文件仅依赖 `core/*` 暴露的工具函数，便于后续增加新站点或替换实现。

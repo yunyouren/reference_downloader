@@ -1,0 +1,54 @@
+[
+    {
+        "domain": ".aps.org",
+        "expirationDate": 1804746610.94457,
+        "hostOnly": false,
+        "httpOnly": false,
+        "name": "osano_consentmanager_uuid",
+        "path": "/",
+        "sameSite": "lax",
+        "secure": true,
+        "session": false,
+        "storeId": null,
+        "value": "c94de33b-084d-4504-975d-0f91a0d3b793"
+    },
+    {
+        "domain": "journals.aps.org",
+        "expirationDate": 1773221422.363323,
+        "hostOnly": true,
+        "httpOnly": true,
+        "name": "apsjournals.session",
+        "path": "/",
+        "sameSite": null,
+        "secure": false,
+        "session": false,
+        "storeId": null,
+        "value": "BAh7DUkiD3Nlc3Npb25faWQGOgZFVG86HVJhY2s6OlNlc3Npb246OlNlc3Npb25JZAY6D0BwdWJsaWNfaWRJIkU0ZTIxNjgxODY1YTZiN2MxZjI5MTUxOWU4NjEwODg1OWY5ZjY5ZDVkNWU1MzcwMjBiYTQyYTk5ZmQyYmJlODRmBjsARkkiB2lkBjsARkkiKWEyYmVkNjdmLTI3MWYtNDdhNC05ZGRlLTE4MzUyZjY5MGU1NgY7AEZJIgljc3JmBjsARkkiRWY4MjFkNDkwOTJkMDA5ZjRkODI2NDdjY2IxMWNiOTgwMzdhZWM1YmRkZjg5YzM4NDI4NTljOTViZWNhNDUyYjYGOwBGSSILX2ZsYXNoBjsARnsASSIab3BlbmF0aGVuc191c2VyX25vbmNlBjsARkkiJTdhZDRlZmIzNDIzYWU1YmU3MzAzNmI3YThiNzRmZDE3BjsARkkiIG9wZW5hdGhlbnNfdXNlcl9zdGF0ZWNoa3N1bQY7AEZJIiU4YTFkNDQ4OTUzODgzOTY2ZWFiNjU3ZDRlOGEzM2M5ZAY7AEZJIhVhcHNfbWVtYmVyX25vbmNlBjsARkkiJWI4NDVmNTU1NDlhNGRiZDU5OWIwMjBkZjMxZmRhZGMxBjsARkkiG2Fwc19tZW1iZXJfc3RhdGVjaGtzdW0GOwBGSSIlYWYzYzNhYzE5MTYxOGRjOTI5MWRlNzVhMTFjNjk1ZWMGOwBG--6a420f00bd46a3581ddd46d63adf8b3538db74b5"
+    },
+    {
+        "domain": ".aps.org",
+        "expirationDate": 1804746610.945084,
+        "hostOnly": false,
+        "httpOnly": false,
+        "name": "osano_consentmanager",
+        "path": "/",
+        "sameSite": "lax",
+        "secure": true,
+        "session": false,
+        "storeId": null,
+        "value": "jV18R94ohLFa3SE56bdBU4lfY3rYS6-PelToL0b8wvzoV_p_t1vxHfQJsHp0IIsQvT2nKF3Lgu71_2KpX90Vxe9etsuo7bJ9AcypWIDe0ax1_inuBytH1BuDV0C6n95wn_HcUub1O5KcoQvE_fDGxBmoeWxe04rZReh0fSipD0VR6t3RMVfRiOJOHy3uLyHwDpq6aPoD3m8PvBR8QhZlg28tT8j2cNdkoUzZntJRFNI7w0u7OkcCWLh7qZV02aoamd4AJ8QRG7SdPoI9E0bjiCQ0y_QZGbez-ibCqFTvpnlOVC_emDg-Hs07pwhD29zWEO_s1JKLkdw="
+    },
+    {
+        "domain": ".aps.org",
+        "expirationDate": 1773212398.358669,
+        "hostOnly": false,
+        "httpOnly": true,
+        "name": "__cf_bm",
+        "path": "/",
+        "sameSite": null,
+        "secure": true,
+        "session": false,
+        "storeId": null,
+        "value": "xe7emBI4CTyR46P7dhc1M.zGzck9N75fp4AEEXXNjBk-1773210599.958724-1.0.1.1-07l7zGs1szv7V.EBwyYQE.AtpqG0dFrdDn2GEcQfMxO6e7Db73j2M4psDS2ZD9LwvJ8VsAjxKs97LOdRz2SMwBdJJMbRTonZ1fDOCXT8m9tcMfhyawQutxINYqw.yRHX"
+    }
+]

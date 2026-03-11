@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python reference_tool.py --config reference_tool.config.json)",
+      "Bash(python -c \"import reference_tool; print\\(''Import OK''\\)\")",
+      "Bash(python -c \"from site_handlers.domain_analyzer import analyze_reference_domains, DomainInfo; from interactive_ui import should_run_interactive; print\\(''All imports OK''\\)\")",
+      "Bash(python reference_tool.py --help)",
+      "Bash(python reference_tool.py --input \"Metamaterials and Fluid Flows.pdf\" --output test_output --no-download --interactive false)",
+      "Bash(python reference_tool.py --input \"Metamaterials and Fluid Flows.pdf\" --config reference_tool.config.json --interactive false)",
+      "Bash(mkdir -p cookies)",
+      "Bash(touch cookies/aps.json cookies/cambridge.json cookies/aiaa.json cookies/aip.json cookies/royalsociety.json cookies/annualreviews.json cookies/asme.json cookies/acs.json cookies/science.json)",
+      "Bash(curl -s \"https://api.unpaywall.org/v2/10.1038/s41598-017-17765-5?email=test@example.com\")"
+    ]
+  }
+}

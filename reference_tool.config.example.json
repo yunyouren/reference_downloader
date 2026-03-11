@@ -9,10 +9,19 @@
   "timeout": 20, // 单次下载 HTTP 超时（秒）
   "lookup_timeout": 6, // 二次检索 API 超时（秒）
   "retries": 1, // 每个候选链接的重试次数
-  "cookies": "", // cookies.txt 路径（Netscape 格式；留空则不使用；请勿分享该文件）
+  "cookies": "", // 全局 cookies.txt 路径（Netscape 或 JSON 格式；留空则不使用；请勿分享该文件）
   "verify_title_rename": false, // 下载后读取 PDF 标题做匹配校验，命中则按标题重命名
   "verify_title_threshold": 0.55, // 标题匹配阈值（0~1，越大越严格）
+  "verify_title_weight": 1.0, // 校验打分：PDF 标题匹配权重
+  "verify_line_weight": 1.0, // 校验打分：第一页最佳行匹配权重
+  "verify_year_hit_bonus": 0.0, // 校验打分：年份命中加分
+  "verify_year_miss_mult": 0.95, // 校验打分：年份不命中乘法惩罚
+  "verify_author_hit_bonus": 0.0, // 校验打分：作者姓命中加分
+  "verify_author_miss_mult": 0.97, // 校验打分：作者姓不命中乘法惩罚
   "verified_subdir": "verified_pdfs", // 校验通过的 PDF 额外放到 downloads/<subdir>（空字符串禁用）
+  "meta_subdir": "meta", // meta.txt 输出到 downloads/<subdir>（空字符串禁用）
+  "landing_subdir": "landing_urls", // landing.url.txt 输出到 downloads/<subdir>（空字符串禁用）
+  "mismatch_subdir": "mismatch_pdfs", // mismatch.pdf 输出到 downloads/<subdir>（空字符串禁用）
 
   "workers": 8, // 并发线程数
   "max_per_domain": 2, // 每个域名最大并发请求数（0 表示不限制）
@@ -20,6 +29,7 @@
   "user_agent": "ReferenceDownloader/1.1", // HTTP User-Agent
 
   "download_log": "download_log.csv", // 下载尝试日志文件名（空字符串可禁用）
+  "resume": true, // 若输出目录已有 references.json，则复用已完成下载结果
 
   "max_candidates_per_item": 3, // 每条参考文献最多尝试多少个链接（0 表示不限）
   "skip_doi": false, // 初次下载阶段是否跳过 DOI 直连
@@ -28,7 +38,15 @@
   "secondary_lookup": false, // 是否对失败项做二次检索（Crossref/OpenAlex）
   "secondary_max": 40, // 二次检索最多处理多少条失败项
   "secondary_top_k": 2, // 二次检索：按标题相似度排序，仅保留前 K 个候选（0 表示不限制）
+  "secondary_cache": "cache/secondary_lookup_cache.json", // 二次检索缓存文件（相对于 output；空字符串禁用）
 
   "no_download": false, // 仅解析与导出，不进行任何下载
-  "no_progress": false // 关闭进度条（未安装 tqdm 时自动无进度条）
+  "no_progress": false, // 关闭进度条（未安装 tqdm 时自动无进度条）
+
+  // === 域名cookies配置（新功能） ===
+  "domain_cookies_file": "domain_cookies.json", // 按域名配置的cookies存储文件（相对于 output）
+  "interactive": "auto", // 交互模式："auto"(自动检测TTY) | "true"(强制交互) | "false"(批处理模式)
+
+  // === 开放获取支持 ===
+  "unpaywall_email": "" // 你的邮箱（用于Unpaywall API查找开放获取PDF；留空则不使用）
 }

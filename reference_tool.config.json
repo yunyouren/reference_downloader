@@ -1,0 +1,45 @@
+{
+  "input": "Metamaterials and Fluid Flows.pdf",
+  "output": "references_output",
+
+  "pdf_parser": "pypdf",
+  "header_margin": 40.0,
+  "footer_margin": 40.0,
+
+  "timeout": 20,
+  "lookup_timeout": 6,
+  "retries": 1,
+  "cookies": "",
+  "verify_title_rename": false,
+  "verify_title_threshold": 0.55,
+  "verify_title_weight": 1.0,
+  "verify_line_weight": 1.0,
+  "verify_year_hit_bonus": 0.0,
+  "verify_year_miss_mult": 0.95,
+  "verify_author_hit_bonus": 0.0,
+  "verify_author_miss_mult": 0.97,
+  "verified_subdir": "verified_pdfs",
+  "meta_subdir": "meta",
+  "landing_subdir": "landing_urls",
+  "mismatch_subdir": "mismatch_pdfs",
+
+  "workers": 8,
+  "max_per_domain": 2,
+  "min_domain_delay_ms": 0,
+  "user_agent": "ReferenceDownloader/1.1",
+
+  "download_log": "download_log.csv",
+  "resume": true,
+
+  "max_candidates_per_item": 3,
+  "skip_doi": false,
+  "download_max": 0,
+
+  "secondary_lookup": true,
+  "secondary_max": 40,
+  "secondary_top_k": 2,
+  "secondary_cache": "cache/secondary_lookup_cache.json",
+
+  "no_download": false,
+  "no_progress": false
+}
