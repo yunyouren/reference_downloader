@@ -40,6 +40,11 @@
   "secondary_top_k": 2, // 二次检索：按标题相似度排序，仅保留前 K 个候选（0 表示不限制）
   "secondary_cache": "cache/secondary_lookup_cache.json", // 二次检索缓存文件（相对于 output；空字符串禁用）
   "generic_download_sites": [
+    "https://arxiv.org/search/?query={title_encoded}&searchtype=all",
+    "https://www.semanticscholar.org/search?q={title_encoded}",
+    "https://core.ac.uk/search?q=doi:{doi_encoded}",
+    "https://www.base-search.net/Search/Results?lookfor={title_encoded}&type=all&oaboost=1",
+    "https://doaj.org/search/articles/{title_encoded}",
     "https://sci-hub.se/{doi}"
   ], // 自定义通用下载站点模板；支持 {doi}/{doi_encoded}/{title}/{title_encoded}
 

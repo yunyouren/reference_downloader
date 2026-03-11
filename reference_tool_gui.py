@@ -31,14 +31,34 @@ STATUS_ORDER = ["downloaded_pdf", "saved_landing_url", "failed", "not_attempted"
 I18N = {
     "zh": {
         "title": "参考文献工具 GUI",
+        "language": "语言",
         "input": "输入 PDF",
         "output": "输出目录",
         "config": "配置文件",
-        "cookies": "Cookies",
+        "cookies": "登录凭据文件",
+        "cookies_folder": "登录凭据文件夹",
+        "domain_cookies_file": "域名凭据配置文件",
+        "build": "构建",
+        "edit_map": "编辑映射",
+        "workers": "线程数",
+        "timeout": "超时",
+        "retries": "重试",
+        "max_candidates": "最大候选数",
+        "verify_threshold": "校验阈值",
+        "pdf_parser": "PDF 解析器",
+        "secondary_lookup": "二次检索",
+        "secondary_max": "二次最大数",
+        "secondary_top_k": "二次 TopK",
+        "verify_rename": "校验并重命名",
+        "rename_mode": "重命名模式",
+        "parameter_help": "参数说明",
         "run": "运行",
         "stop": "停止",
         "load": "加载配置",
         "save": "保存配置",
+        "recommend": "推荐参数",
+        "rename_only": "仅重命名",
+        "edit_generic_sites": "编辑通用站点",
         "refresh": "刷新统计",
         "open_output": "打开输出目录",
         "logs": "实时日志",
@@ -48,18 +68,52 @@ I18N = {
         "finished": "已完成",
         "stopped": "已停止",
         "invalid": "参数错误",
+        "save_btn": "保存",
+        "cancel_btn": "取消",
+        "custom_map_title": "自定义期刊 -> 域名",
+        "custom_map_prompt": "JSON 对象：{\"期刊名\": [\"域名1\", \"域名2\"]}\n也支持逗号分隔字符串值。\nCookies 文件夹中的文件名（不含后缀）需匹配期刊名。",
+        "generic_sites_title": "通用下载站点",
+        "generic_sites_prompt": "支持占位符：{doi}, {doi_encoded}, {title}, {title_encoded}。\n每行一个模板，编辑后点击保存。\n示例：https://sci-hub.se/{doi} | https://example.org/search?q={title_encoded}",
+        "url_template": "URL 模板",
+        "add": "添加",
+        "add_scihub": "添加 Sci-Hub",
+        "add_oa_pack": "添加开放获取站点包",
+        "add_title_search": "添加标题检索",
+        "delete_selected": "删除选中",
+        "move_up": "上移",
+        "move_down": "下移",
+        "invalid_url_template": "无效 URL 模板",
+        "enable_verify_rename_first": "请先启用“校验并重命名”。",
     },
     "en": {
         "title": "Reference Tool GUI",
+        "language": "Language",
         "input": "Input PDF",
         "output": "Output Dir",
         "config": "Config",
         "cookies": "Cookies",
+        "cookies_folder": "Cookies Folder",
+        "domain_cookies_file": "Domain Cookies File",
+        "build": "Build",
+        "edit_map": "Edit Map",
+        "workers": "workers",
+        "timeout": "timeout",
+        "retries": "retries",
+        "max_candidates": "max_candidates",
+        "verify_threshold": "verify_threshold",
+        "pdf_parser": "pdf_parser",
+        "secondary_lookup": "secondary_lookup",
+        "secondary_max": "secondary_max",
+        "secondary_top_k": "secondary_top_k",
+        "verify_rename": "verify_rename",
+        "rename_mode": "rename_mode",
+        "parameter_help": "Parameter Help",
         "run": "Run",
         "stop": "Stop",
         "load": "Load Config",
         "save": "Save Config",
         "recommend": "Recommended Preset",
+        "edit_generic_sites": "Edit Generic Sites",
         "refresh": "Refresh Summary",
         "open_output": "Open Output",
         "rename_only": "Rename Only",
@@ -70,6 +124,22 @@ I18N = {
         "finished": "Finished",
         "stopped": "Stopped",
         "invalid": "Invalid settings",
+        "save_btn": "Save",
+        "cancel_btn": "Cancel",
+        "custom_map_title": "Custom Journal -> Domains",
+        "custom_map_prompt": "JSON object: {\"journal_name\": [\"domain1\", \"domain2\"]}\nYou can also use comma-separated string values.\nFile stem in cookies folder should match journal_name.",
+        "generic_sites_title": "Generic Download Sites",
+        "generic_sites_prompt": "Placeholders: {doi}, {doi_encoded}, {title}, {title_encoded}.\nAdd one template per row, then Save.\nExamples: https://sci-hub.se/{doi} | https://example.org/search?q={title_encoded}",
+        "url_template": "URL Template",
+        "add": "Add",
+        "add_scihub": "Add Sci-Hub",
+        "add_oa_pack": "Add OA Pack",
+        "add_title_search": "Add Title Search",
+        "delete_selected": "Delete Selected",
+        "move_up": "Move Up",
+        "move_down": "Move Down",
+        "invalid_url_template": "invalid URL template",
+        "enable_verify_rename_first": "Please enable verify_rename first.",
     },
 }
 
@@ -87,6 +157,15 @@ RENAME_MODE_LABELS = {
 }
 
 
+DEFAULT_GENERIC_DOWNLOAD_SITES: list[str] = [
+    "https://arxiv.org/search/?query={title_encoded}&searchtype=all",
+    "https://www.semanticscholar.org/search?q={title_encoded}",
+    "https://core.ac.uk/search?q=doi:{doi_encoded}",
+    "https://www.base-search.net/Search/Results?lookfor={title_encoded}&type=all&oaboost=1",
+    "https://doaj.org/search/articles/{title_encoded}",
+]
+
+
 def recommended_download_preset() -> dict[str, Any]:
     return {
         "pdf_parser": "pdfplumber",
@@ -96,6 +175,7 @@ def recommended_download_preset() -> dict[str, Any]:
         "max_candidates_per_item": 5,
         "retries": 2,
         "timeout": 25,
+        "generic_download_sites": list(DEFAULT_GENERIC_DOWNLOAD_SITES),
     }
 
 
@@ -410,8 +490,78 @@ class ReferenceToolGUI:
         self.status_var.set(self._tr(key))
 
     def _on_lang_change(self, *_: Any) -> None:
+        self._refresh_static_texts()
         self._refresh_rename_mode_labels()
         self._refresh_help_text()
+
+    def _refresh_static_texts(self) -> None:
+        self.root.title(self._tr("title"))
+        if hasattr(self, "lang_label"):
+            self.lang_label.configure(text=self._tr("language"))
+        if hasattr(self, "help_frame"):
+            self.help_frame.configure(text=self._tr("parameter_help"))
+        if hasattr(self, "lbl_input"):
+            self.lbl_input.configure(text=self._tr("input"))
+        if hasattr(self, "lbl_output"):
+            self.lbl_output.configure(text=self._tr("output"))
+        if hasattr(self, "lbl_config"):
+            self.lbl_config.configure(text=self._tr("config"))
+        if hasattr(self, "lbl_cookies"):
+            self.lbl_cookies.configure(text=self._tr("cookies"))
+        if hasattr(self, "lbl_cookies_folder"):
+            self.lbl_cookies_folder.configure(text=self._tr("cookies_folder"))
+        if hasattr(self, "lbl_domain_cookies_file"):
+            self.lbl_domain_cookies_file.configure(text=self._tr("domain_cookies_file"))
+        if hasattr(self, "btn_build_domain"):
+            self.btn_build_domain.configure(text=self._tr("build"))
+        if hasattr(self, "btn_edit_map"):
+            self.btn_edit_map.configure(text=self._tr("edit_map"))
+        if hasattr(self, "lbl_workers"):
+            self.lbl_workers.configure(text=self._tr("workers"))
+        if hasattr(self, "lbl_timeout"):
+            self.lbl_timeout.configure(text=self._tr("timeout"))
+        if hasattr(self, "lbl_retries"):
+            self.lbl_retries.configure(text=self._tr("retries"))
+        if hasattr(self, "lbl_max_candidates"):
+            self.lbl_max_candidates.configure(text=self._tr("max_candidates"))
+        if hasattr(self, "lbl_verify_threshold"):
+            self.lbl_verify_threshold.configure(text=self._tr("verify_threshold"))
+        if hasattr(self, "lbl_pdf_parser"):
+            self.lbl_pdf_parser.configure(text=self._tr("pdf_parser"))
+        if hasattr(self, "chk_secondary_lookup"):
+            self.chk_secondary_lookup.configure(text=self._tr("secondary_lookup"))
+        if hasattr(self, "lbl_secondary_max"):
+            self.lbl_secondary_max.configure(text=self._tr("secondary_max"))
+        if hasattr(self, "lbl_secondary_top_k"):
+            self.lbl_secondary_top_k.configure(text=self._tr("secondary_top_k"))
+        if hasattr(self, "chk_verify_rename"):
+            self.chk_verify_rename.configure(text=self._tr("verify_rename"))
+        if hasattr(self, "lbl_rename_mode"):
+            self.lbl_rename_mode.configure(text=self._tr("rename_mode"))
+        if hasattr(self, "run_btn"):
+            self.run_btn.configure(text=self._tr("run"))
+        if hasattr(self, "stop_btn"):
+            self.stop_btn.configure(text=self._tr("stop"))
+        if hasattr(self, "load_btn"):
+            self.load_btn.configure(text=self._tr("load"))
+        if hasattr(self, "save_btn"):
+            self.save_btn.configure(text=self._tr("save"))
+        if hasattr(self, "recommend_btn"):
+            self.recommend_btn.configure(text=self._tr("recommend"))
+        if hasattr(self, "edit_generic_sites_btn"):
+            self.edit_generic_sites_btn.configure(text=self._tr("edit_generic_sites"))
+        if hasattr(self, "rename_only_btn"):
+            self.rename_only_btn.configure(text=self._tr("rename_only"))
+        if hasattr(self, "refresh_btn"):
+            self.refresh_btn.configure(text=self._tr("refresh"))
+        if hasattr(self, "open_output_btn"):
+            self.open_output_btn.configure(text=self._tr("open_output"))
+        if hasattr(self, "tabs"):
+            self.tabs.tab(0, text=self._tr("logs"))
+            self.tabs.tab(1, text=self._tr("summary"))
+        if hasattr(self, "status_var") and self.status_var.get():
+            # keep semantic status key behavior from _set_status callers
+            pass
 
     def _current_rename_mode_value(self) -> str:
         return rename_mode_label_to_value(self.verify_rename_mode_var.get(), self.lang_var.get())
@@ -442,7 +592,8 @@ class ReferenceToolGUI:
 
         lang_row = ttk.Frame(frame)
         lang_row.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(lang_row, text="Language").pack(side=tk.LEFT)
+        self.lang_label = ttk.Label(lang_row, text=self._tr("language"))
+        self.lang_label.pack(side=tk.LEFT)
         ttk.Combobox(lang_row, textvariable=self.lang_var, values=["en", "zh"], state="readonly", width=8).pack(
             side=tk.LEFT, padx=(6, 0)
         )
@@ -453,54 +604,68 @@ class ReferenceToolGUI:
 
         left = ttk.Frame(top)
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        right = ttk.LabelFrame(top, text="Parameter Help")
-        right.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
+        self.help_frame = ttk.LabelFrame(top, text=self._tr("parameter_help"))
+        self.help_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
 
-        self.help_text = ScrolledText(right, width=44, height=26, wrap=tk.WORD)
+        self.help_text = ScrolledText(self.help_frame, width=44, height=26, wrap=tk.WORD)
         self.help_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         self._refresh_help_text()
 
         settings = ttk.Frame(left)
         settings.pack(fill=tk.X)
-        ttk.Label(settings, text=self._tr("input")).grid(row=0, column=0, sticky="w")
+        self.lbl_input = ttk.Label(settings, text=self._tr("input"))
+        self.lbl_input.grid(row=0, column=0, sticky="w")
         ttk.Entry(settings, textvariable=self.input_var, width=92).grid(row=0, column=1, sticky="ew", padx=6)
         ttk.Button(settings, text="...", width=4, command=self._pick_input).grid(row=0, column=2)
-        ttk.Label(settings, text=self._tr("output")).grid(row=1, column=0, sticky="w")
+        self.lbl_output = ttk.Label(settings, text=self._tr("output"))
+        self.lbl_output.grid(row=1, column=0, sticky="w")
         ttk.Entry(settings, textvariable=self.output_var, width=92).grid(row=1, column=1, sticky="ew", padx=6)
         ttk.Button(settings, text="...", width=4, command=self._pick_output).grid(row=1, column=2)
-        ttk.Label(settings, text=self._tr("config")).grid(row=2, column=0, sticky="w")
+        self.lbl_config = ttk.Label(settings, text=self._tr("config"))
+        self.lbl_config.grid(row=2, column=0, sticky="w")
         ttk.Entry(settings, textvariable=self.config_var, width=92).grid(row=2, column=1, sticky="ew", padx=6)
         ttk.Button(settings, text="...", width=4, command=self._pick_config).grid(row=2, column=2)
-        ttk.Label(settings, text=self._tr("cookies")).grid(row=3, column=0, sticky="w")
+        self.lbl_cookies = ttk.Label(settings, text=self._tr("cookies"))
+        self.lbl_cookies.grid(row=3, column=0, sticky="w")
         ttk.Entry(settings, textvariable=self.cookies_var, width=92).grid(row=3, column=1, sticky="ew", padx=6)
         ttk.Button(settings, text="...", width=4, command=self._pick_cookies).grid(row=3, column=2)
-        ttk.Label(settings, text="Cookies Folder").grid(row=4, column=0, sticky="w")
+        self.lbl_cookies_folder = ttk.Label(settings, text=self._tr("cookies_folder"))
+        self.lbl_cookies_folder.grid(row=4, column=0, sticky="w")
         ttk.Entry(settings, textvariable=self.cookies_folder_var, width=92).grid(row=4, column=1, sticky="ew", padx=6)
         ttk.Button(settings, text="...", width=4, command=self._pick_cookies_folder).grid(row=4, column=2)
-        ttk.Label(settings, text="Domain Cookies File").grid(row=5, column=0, sticky="w")
+        self.lbl_domain_cookies_file = ttk.Label(settings, text=self._tr("domain_cookies_file"))
+        self.lbl_domain_cookies_file.grid(row=5, column=0, sticky="w")
         ttk.Entry(settings, textvariable=self.domain_cookies_file_var, width=92).grid(row=5, column=1, sticky="ew", padx=6)
         domain_actions = ttk.Frame(settings)
         domain_actions.grid(row=5, column=2, sticky="e")
-        ttk.Button(domain_actions, text="Build", width=6, command=self._build_domain_cookies_file).pack(side=tk.LEFT)
-        ttk.Button(domain_actions, text="Edit Map", width=10, command=self._edit_custom_cookie_domains).pack(side=tk.LEFT, padx=(4, 0))
+        self.btn_build_domain = ttk.Button(domain_actions, text=self._tr("build"), width=6, command=self._build_domain_cookies_file)
+        self.btn_build_domain.pack(side=tk.LEFT)
+        self.btn_edit_map = ttk.Button(domain_actions, text=self._tr("edit_map"), width=10, command=self._edit_custom_cookie_domains)
+        self.btn_edit_map.pack(side=tk.LEFT, padx=(4, 0))
         settings.grid_columnconfigure(1, weight=1)
 
         row2 = ttk.Frame(left)
         row2.pack(fill=tk.X, pady=(8, 0))
-        ttk.Label(row2, text="workers").pack(side=tk.LEFT)
+        self.lbl_workers = ttk.Label(row2, text=self._tr("workers"))
+        self.lbl_workers.pack(side=tk.LEFT)
         ttk.Entry(row2, textvariable=self.workers_var, width=8).pack(side=tk.LEFT, padx=(4, 10))
-        ttk.Label(row2, text="timeout").pack(side=tk.LEFT)
+        self.lbl_timeout = ttk.Label(row2, text=self._tr("timeout"))
+        self.lbl_timeout.pack(side=tk.LEFT)
         ttk.Entry(row2, textvariable=self.timeout_var, width=8).pack(side=tk.LEFT, padx=(4, 10))
-        ttk.Label(row2, text="retries").pack(side=tk.LEFT)
+        self.lbl_retries = ttk.Label(row2, text=self._tr("retries"))
+        self.lbl_retries.pack(side=tk.LEFT)
         ttk.Entry(row2, textvariable=self.retries_var, width=8).pack(side=tk.LEFT, padx=(4, 10))
-        ttk.Label(row2, text="max_candidates").pack(side=tk.LEFT)
+        self.lbl_max_candidates = ttk.Label(row2, text=self._tr("max_candidates"))
+        self.lbl_max_candidates.pack(side=tk.LEFT)
         ttk.Entry(row2, textvariable=self.max_candidates_var, width=8).pack(side=tk.LEFT, padx=(4, 10))
-        ttk.Label(row2, text="verify_threshold").pack(side=tk.LEFT)
+        self.lbl_verify_threshold = ttk.Label(row2, text=self._tr("verify_threshold"))
+        self.lbl_verify_threshold.pack(side=tk.LEFT)
         ttk.Entry(row2, textvariable=self.verify_threshold_var, width=8).pack(side=tk.LEFT, padx=(4, 10))
 
         row3 = ttk.Frame(left)
         row3.pack(fill=tk.X, pady=(6, 0))
-        ttk.Label(row3, text="pdf_parser").pack(side=tk.LEFT)
+        self.lbl_pdf_parser = ttk.Label(row3, text=self._tr("pdf_parser"))
+        self.lbl_pdf_parser.pack(side=tk.LEFT)
         ttk.Combobox(
             row3,
             textvariable=self.pdf_parser_var,
@@ -508,13 +673,18 @@ class ReferenceToolGUI:
             state="readonly",
             width=14,
         ).pack(side=tk.LEFT, padx=(4, 10))
-        ttk.Checkbutton(row3, text="secondary_lookup", variable=self.secondary_lookup_var).pack(side=tk.LEFT, padx=(4, 10))
-        ttk.Label(row3, text="secondary_max").pack(side=tk.LEFT)
+        self.chk_secondary_lookup = ttk.Checkbutton(row3, text=self._tr("secondary_lookup"), variable=self.secondary_lookup_var)
+        self.chk_secondary_lookup.pack(side=tk.LEFT, padx=(4, 10))
+        self.lbl_secondary_max = ttk.Label(row3, text=self._tr("secondary_max"))
+        self.lbl_secondary_max.pack(side=tk.LEFT)
         ttk.Entry(row3, textvariable=self.secondary_max_var, width=8).pack(side=tk.LEFT, padx=(4, 10))
-        ttk.Label(row3, text="secondary_top_k").pack(side=tk.LEFT)
+        self.lbl_secondary_top_k = ttk.Label(row3, text=self._tr("secondary_top_k"))
+        self.lbl_secondary_top_k.pack(side=tk.LEFT)
         ttk.Entry(row3, textvariable=self.secondary_top_k_var, width=8).pack(side=tk.LEFT, padx=(4, 10))
-        ttk.Checkbutton(row3, text="verify_rename", variable=self.verify_rename_var).pack(side=tk.LEFT, padx=(12, 10))
-        ttk.Label(row3, text="rename_mode").pack(side=tk.LEFT)
+        self.chk_verify_rename = ttk.Checkbutton(row3, text=self._tr("verify_rename"), variable=self.verify_rename_var)
+        self.chk_verify_rename.pack(side=tk.LEFT, padx=(12, 10))
+        self.lbl_rename_mode = ttk.Label(row3, text=self._tr("rename_mode"))
+        self.lbl_rename_mode.pack(side=tk.LEFT)
         self.rename_mode_combo = ttk.Combobox(
             row3,
             textvariable=self.verify_rename_mode_var,
@@ -531,23 +701,30 @@ class ReferenceToolGUI:
         self.stop_btn = ttk.Button(actions, text=self._tr("stop"), command=self._stop)
         self.stop_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.stop_btn.state(["disabled"])
-        ttk.Button(actions, text=self._tr("load"), command=self._load_config).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(actions, text=self._tr("save"), command=self._save_config).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(actions, text=self._tr("recommend"), command=self._apply_recommended_preset).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(actions, text="Edit Generic Sites", command=self._edit_generic_download_sites).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(actions, text=self._tr("rename_only"), command=self._rename_only).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(actions, text=self._tr("refresh"), command=self._refresh_summary).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(actions, text=self._tr("open_output"), command=self._open_output).pack(side=tk.LEFT, padx=(0, 6))
+        self.load_btn = ttk.Button(actions, text=self._tr("load"), command=self._load_config)
+        self.load_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.save_btn = ttk.Button(actions, text=self._tr("save"), command=self._save_config)
+        self.save_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.recommend_btn = ttk.Button(actions, text=self._tr("recommend"), command=self._apply_recommended_preset)
+        self.recommend_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.edit_generic_sites_btn = ttk.Button(actions, text=self._tr("edit_generic_sites"), command=self._edit_generic_download_sites)
+        self.edit_generic_sites_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.rename_only_btn = ttk.Button(actions, text=self._tr("rename_only"), command=self._rename_only)
+        self.rename_only_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.refresh_btn = ttk.Button(actions, text=self._tr("refresh"), command=self._refresh_summary)
+        self.refresh_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.open_output_btn = ttk.Button(actions, text=self._tr("open_output"), command=self._open_output)
+        self.open_output_btn.pack(side=tk.LEFT, padx=(0, 6))
 
         self.progress = ttk.Progressbar(left, mode="indeterminate")
         self.progress.pack(fill=tk.X, pady=(8, 0))
 
-        tabs = ttk.Notebook(left)
-        tabs.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
-        log_tab = ttk.Frame(tabs)
-        summary_tab = ttk.Frame(tabs)
-        tabs.add(log_tab, text=self._tr("logs"))
-        tabs.add(summary_tab, text=self._tr("summary"))
+        self.tabs = ttk.Notebook(left)
+        self.tabs.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        log_tab = ttk.Frame(self.tabs)
+        summary_tab = ttk.Frame(self.tabs)
+        self.tabs.add(log_tab, text=self._tr("logs"))
+        self.tabs.add(summary_tab, text=self._tr("summary"))
         self.log_text = ScrolledText(log_tab, wrap=tk.WORD)
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         self.log_text.configure(state=tk.DISABLED)
@@ -556,6 +733,7 @@ class ReferenceToolGUI:
         self.summary_text.configure(state=tk.DISABLED)
 
         ttk.Label(left, textvariable=self.status_var).pack(fill=tk.X, pady=(6, 0))
+        self._refresh_static_texts()
 
     def _pick_input(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("PDF", "*.pdf"), ("All files", "*.*")])
@@ -608,16 +786,12 @@ class ReferenceToolGUI:
 
     def _edit_custom_cookie_domains(self) -> None:
         editor = tk.Toplevel(self.root)
-        editor.title("Custom Journal -> Domains")
+        editor.title(self._tr("custom_map_title"))
         editor.geometry("720x500")
         editor.transient(self.root)
         editor.grab_set()
 
-        prompt = (
-            "JSON object: {\"journal_name\": [\"domain1\", \"domain2\"]}\n"
-            "You can also use comma-separated string values.\n"
-            "File stem in cookies folder should match journal_name."
-        )
+        prompt = self._tr("custom_map_prompt")
         ttk.Label(editor, text=prompt, justify=tk.LEFT).pack(fill=tk.X, padx=10, pady=(10, 6))
 
         body = ScrolledText(editor, wrap=tk.WORD)
@@ -646,46 +820,108 @@ class ReferenceToolGUI:
             except Exception as exc:
                 messagebox.showerror(self._tr("invalid"), str(exc))
 
-        ttk.Button(btns, text="Save", command=on_save).pack(side=tk.RIGHT)
-        ttk.Button(btns, text="Cancel", command=editor.destroy).pack(side=tk.RIGHT, padx=(0, 6))
+        ttk.Button(btns, text=self._tr("save_btn"), command=on_save).pack(side=tk.RIGHT)
+        ttk.Button(btns, text=self._tr("cancel_btn"), command=editor.destroy).pack(side=tk.RIGHT, padx=(0, 6))
 
     def _edit_generic_download_sites(self) -> None:
         editor = tk.Toplevel(self.root)
-        editor.title("Generic Download Sites")
-        editor.geometry("720x500")
+        editor.title(self._tr("generic_sites_title"))
+        editor.geometry("860x560")
         editor.transient(self.root)
         editor.grab_set()
 
-        prompt = (
-            "JSON array of URL templates.\n"
-            "Placeholders: {doi}, {doi_encoded}, {title}, {title_encoded}.\n"
-            "Examples:\n"
-            "  https://sci-hub.se/{doi}\n"
-            "  https://example.org/search?q={title_encoded}"
-        )
+        prompt = self._tr("generic_sites_prompt")
         ttk.Label(editor, text=prompt, justify=tk.LEFT).pack(fill=tk.X, padx=10, pady=(10, 6))
 
-        body = ScrolledText(editor, wrap=tk.WORD)
-        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
-        initial = self.generic_download_sites or ["https://sci-hub.se/{doi}"]
-        body.insert("1.0", json.dumps(initial, ensure_ascii=False, indent=2))
+        table_frame = ttk.Frame(editor)
+        table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 8))
+
+        tree = ttk.Treeview(table_frame, columns=("template",), show="headings", height=12)
+        tree.heading("template", text=self._tr("url_template"))
+        tree.column("template", width=740, anchor="w")
+        yscroll = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=yscroll.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        yscroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        for url in (self.generic_download_sites or list(DEFAULT_GENERIC_DOWNLOAD_SITES)):
+            tree.insert("", tk.END, values=(url,))
+
+        edit_row = ttk.Frame(editor)
+        edit_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+        new_template_var = tk.StringVar(value="")
+        ttk.Entry(edit_row, textvariable=new_template_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        def add_row(template: str) -> None:
+            value = str(template or "").strip()
+            if not value:
+                return
+            tree.insert("", tk.END, values=(value,))
+            new_template_var.set("")
+
+        def add_oa_pack() -> None:
+            existing = {
+                str(tree.item(item_id, "values")[0]).strip()
+                for item_id in tree.get_children("")
+                if tree.item(item_id, "values")
+            }
+            for site in DEFAULT_GENERIC_DOWNLOAD_SITES:
+                if site not in existing:
+                    tree.insert("", tk.END, values=(site,))
+                    existing.add(site)
+
+        ttk.Button(edit_row, text=self._tr("add"), command=lambda: add_row(new_template_var.get())).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(edit_row, text=self._tr("add_scihub"), command=lambda: add_row("https://sci-hub.se/{doi}")).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(edit_row, text=self._tr("add_oa_pack"), command=add_oa_pack).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(
+            edit_row,
+            text=self._tr("add_title_search"),
+            command=lambda: add_row("https://example.org/search?q={title_encoded}"),
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
+        ops_row = ttk.Frame(editor)
+        ops_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+
+        def delete_selected() -> None:
+            selected = tree.selection()
+            for item_id in selected:
+                tree.delete(item_id)
+
+        def move_selected(delta: int) -> None:
+            selected = list(tree.selection())
+            if not selected:
+                return
+            children = list(tree.get_children(""))
+            if delta < 0:
+                selected.sort(key=lambda i: children.index(i))
+            else:
+                selected.sort(key=lambda i: children.index(i), reverse=True)
+            for item_id in selected:
+                current_children = list(tree.get_children(""))
+                idx = current_children.index(item_id)
+                target = idx + delta
+                if target < 0 or target >= len(current_children):
+                    continue
+                tree.move(item_id, "", target)
+
+        ttk.Button(ops_row, text=self._tr("delete_selected"), command=delete_selected).pack(side=tk.LEFT)
+        ttk.Button(ops_row, text=self._tr("move_up"), command=lambda: move_selected(-1)).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(ops_row, text=self._tr("move_down"), command=lambda: move_selected(1)).pack(side=tk.LEFT, padx=(6, 0))
 
         btns = ttk.Frame(editor)
         btns.pack(fill=tk.X, padx=10, pady=(0, 10))
 
         def on_save() -> None:
             try:
-                parsed = json.loads(body.get("1.0", tk.END).strip() or "[]")
-                if not isinstance(parsed, list):
-                    raise ValueError("generic_download_sites must be a JSON array")
                 cleaned: list[str] = []
                 seen: set[str] = set()
-                for row in parsed:
-                    url = str(row or "").strip()
+                for item_id in tree.get_children(""):
+                    values = tree.item(item_id, "values")
+                    url = str(values[0] if values else "").strip()
                     if not url:
                         continue
                     if not url.startswith(("http://", "https://")):
-                        raise ValueError(f"invalid URL template: {url}")
+                        raise ValueError(f"{self._tr('invalid_url_template')}: {url}")
                     if url in seen:
                         continue
                     seen.add(url)
@@ -696,8 +932,8 @@ class ReferenceToolGUI:
             except Exception as exc:
                 messagebox.showerror(self._tr("invalid"), str(exc))
 
-        ttk.Button(btns, text="Save", command=on_save).pack(side=tk.RIGHT)
-        ttk.Button(btns, text="Cancel", command=editor.destroy).pack(side=tk.RIGHT, padx=(0, 6))
+        ttk.Button(btns, text=self._tr("save_btn"), command=on_save).pack(side=tk.RIGHT)
+        ttk.Button(btns, text=self._tr("cancel_btn"), command=editor.destroy).pack(side=tk.RIGHT, padx=(0, 6))
 
     def _collect_config(self) -> dict[str, Any]:
         input_path = Path(self.input_var.get().strip())
@@ -749,6 +985,9 @@ class ReferenceToolGUI:
         self.max_candidates_var.set(str(preset["max_candidates_per_item"]))
         self.retries_var.set(str(preset["retries"]))
         self.timeout_var.set(str(preset["timeout"]))
+        generic_sites = preset.get("generic_download_sites", [])
+        if isinstance(generic_sites, list):
+            self.generic_download_sites = [str(x).strip() for x in generic_sites if str(x).strip()]
 
     def _apply_recommended_preset(self) -> None:
         self._apply_recommended_defaults(notify_if_fallback=True)
@@ -797,7 +1036,7 @@ class ReferenceToolGUI:
     def _rename_only(self) -> None:
         try:
             if not bool(self.verify_rename_var.get()):
-                messagebox.showerror(self._tr("invalid"), "Please enable verify_rename first.")
+                messagebox.showerror(self._tr("invalid"), self._tr("enable_verify_rename_first"))
                 return
             out = Path(self.output_var.get().strip() or ".")
             stats = run_rename_only_on_output(
