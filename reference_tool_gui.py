@@ -24,6 +24,8 @@ from reference_tool import (
     load_config_file,
     parse_first_author_surname,
     parse_ref_year,
+    suggest_cookies_configuration,
+    ReferenceItem,
 )
 
 STATUS_ORDER = ["downloaded_pdf", "saved_landing_url", "failed", "not_attempted"]
@@ -89,6 +91,13 @@ I18N = {
         "unpaywall_email": "Unpaywall 邮箱",
         "preset_speed": "速度优先",
         "preset_qos": "质量优先",
+        "cookies_suggestion": "Cookies 配置建议",
+        "view_cookies_suggestion": "查看 Cookies 建议",
+        "no_cookies_suggestion": "暂无 Cookies 配置建议",
+        "failed_refs": "失败条目",
+        "no_source_refs": "无法识别来源",
+        "domains_need_cookies": "需配置 Cookies 的域名",
+        "suggested_config_file": "建议配置文件",
     },
     "en": {
         "title": "Reference Tool GUI",
@@ -150,6 +159,13 @@ I18N = {
         "unpaywall_email": "Unpaywall Email",
         "preset_speed": "Speed Priority",
         "preset_qos": "Quality Priority",
+        "cookies_suggestion": "Cookies Suggestion",
+        "view_cookies_suggestion": "View Cookies Suggestion",
+        "no_cookies_suggestion": "No cookies suggestion available",
+        "failed_refs": "Failed refs",
+        "no_source_refs": "No source identified",
+        "domains_need_cookies": "Domains need cookies",
+        "suggested_config_file": "Suggested config file",
     },
 }
 
@@ -311,6 +327,30 @@ def load_summary_from_output(output_dir: Path) -> dict[str, int]:
     except Exception:
         return summarize_references_payload([])
     return summarize_references_payload(data)
+
+
+def load_suggested_cookies_config(output_dir: Path) -> dict[str, Any] | None:
+    """加载建议的 cookies 配置文件"""
+    path = output_dir / "suggested_cookies_config.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def load_domain_cookies_config_for_suggestion(path: Path) -> dict[str, Any]:
+    """加载域名 cookies 配置文件"""
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "domains" in data:
+            return data.get("domains", {})
+        return data
+    except Exception:
+        return {}
 
 
 def load_gui_config_payload(path: Path) -> dict[str, Any]:
@@ -585,6 +625,8 @@ class ReferenceToolGUI:
             self.refresh_btn.configure(text=self._tr("refresh"))
         if hasattr(self, "open_output_btn"):
             self.open_output_btn.configure(text=self._tr("open_output"))
+        if hasattr(self, "cookies_suggestion_btn"):
+            self.cookies_suggestion_btn.configure(text=self._tr("view_cookies_suggestion"))
         if hasattr(self, "tabs"):
             self.tabs.tab(0, text=self._tr("logs"))
             self.tabs.tab(1, text=self._tr("summary"))
@@ -757,6 +799,8 @@ class ReferenceToolGUI:
         self.refresh_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.open_output_btn = ttk.Button(actions, text=self._tr("open_output"), command=self._open_output)
         self.open_output_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.cookies_suggestion_btn = ttk.Button(actions, text=self._tr("view_cookies_suggestion"), command=self._view_cookies_suggestion)
+        self.cookies_suggestion_btn.pack(side=tk.LEFT, padx=(0, 6))
 
         self.progress = ttk.Progressbar(left, mode="indeterminate")
         self.progress.pack(fill=tk.X, pady=(8, 0))
@@ -1231,6 +1275,25 @@ class ReferenceToolGUI:
             f"not_attempted: {summary['not_attempted']}",
             f"resolved_by_secondary_lookup: {summary['resolved_by_secondary_lookup']}",
         ]
+
+        # 加载建议的 cookies 配置
+        suggested = load_suggested_cookies_config(out)
+        if suggested and suggested.get("domains"):
+            lines.append("")
+            lines.append("=" * 50)
+            lines.append(self._tr("cookies_suggestion"))
+            lines.append("=" * 50)
+            domains = suggested.get("domains", {})
+            for domain, info in list(domains.items())[:10]:
+                count = info.get("failed_count", "?")
+                desc = info.get("description", domain)
+                lines.append(f"  {domain}: {count} 篇 ({desc})")
+            if len(domains) > 10:
+                lines.append(f"  ... 还有 {len(domains) - 10} 个域名")
+            lines.append("")
+            suggested_file = out / "suggested_cookies_config.json"
+            lines.append(f"{self._tr('suggested_config_file')}: {suggested_file}")
+
         self.summary_text.configure(state=tk.NORMAL)
         self.summary_text.delete("1.0", tk.END)
         self.summary_text.insert(tk.END, "\n".join(lines) + "\n")
@@ -1245,6 +1308,102 @@ class ReferenceToolGUI:
             subprocess.run(["open", str(target)], check=False)
         else:
             subprocess.run(["xdg-open", str(target)], check=False)
+
+    def _view_cookies_suggestion(self) -> None:
+        """显示 Cookies 配置建议对话框"""
+        out = Path(self.output_var.get().strip() or ".")
+        suggested = load_suggested_cookies_config(out)
+
+        if not suggested or not suggested.get("domains"):
+            messagebox.showinfo(self._tr("cookies_suggestion"), self._tr("no_cookies_suggestion"))
+            return
+
+        # 创建对话框
+        dialog = tk.Toplevel(self.root)
+        dialog.title(self._tr("cookies_suggestion"))
+        dialog.geometry("800x600")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        # 说明文字
+        lang = self.lang_var.get()
+        if lang.startswith("zh"):
+            help_text = (
+                "以下机构可能需要配置 Cookies 才能访问 PDF。\n"
+                "配置方法：\n"
+                "1. 在浏览器中登录机构网站（如学校图书馆）\n"
+                "2. 使用浏览器扩展导出 Cookies（推荐 'EditThisCookie' 或 'Cookie Editor'）\n"
+                "3. 将 Cookies 保存为 JSON 或 Netscape 格式文件\n"
+                "4. 编辑 domain_cookies.json 文件，添加配置"
+            )
+        else:
+            help_text = (
+                "The following domains may require cookies to access PDFs.\n"
+                "How to configure:\n"
+                "1. Login to the institution website in your browser\n"
+                "2. Export cookies using a browser extension (e.g., 'EditThisCookie')\n"
+                "3. Save cookies as JSON or Netscape format file\n"
+                "4. Edit domain_cookies.json to add the configuration"
+            )
+
+        ttk.Label(dialog, text=help_text, justify=tk.LEFT).pack(fill=tk.X, padx=10, pady=(10, 6))
+
+        # 创建表格
+        table_frame = ttk.Frame(dialog)
+        table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 8))
+
+        tree = ttk.Treeview(table_frame, columns=("domain", "count", "description", "cookies_path"), show="headings", height=15)
+        tree.heading("domain", text="Domain")
+        tree.heading("count", text="Count")
+        tree.heading("description", text="Description")
+        tree.heading("cookies_path", text="Cookies Path")
+        tree.column("domain", width=200, anchor="w")
+        tree.column("count", width=60, anchor="center")
+        tree.column("description", width=200, anchor="w")
+        tree.column("cookies_path", width=280, anchor="w")
+
+        yscroll = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=yscroll.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        yscroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 填充数据
+        domains = suggested.get("domains", {})
+        for domain, info in domains.items():
+            count = info.get("failed_count", "?")
+            desc = info.get("description", "")
+            cookies_path = info.get("cookies_path", "")
+            tree.insert("", tk.END, values=(domain, count, desc, cookies_path))
+
+        # 按钮
+        btns = ttk.Frame(dialog)
+        btns.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+        def open_suggested_file() -> None:
+            suggested_file = out / "suggested_cookies_config.json"
+            if suggested_file.exists():
+                if os.name == "nt":
+                    os.startfile(str(suggested_file))  # type: ignore[attr-defined]
+                elif sys.platform == "darwin":
+                    subprocess.run(["open", str(suggested_file)], check=False)
+                else:
+                    subprocess.run(["xdg-open", str(suggested_file)], check=False)
+
+        def open_domain_cookies_file() -> None:
+            domain_file = Path(self.domain_cookies_file_var.get().strip() or "domain_cookies.json")
+            if not domain_file.is_absolute():
+                domain_file = self.base_dir / domain_file
+            if domain_file.exists():
+                if os.name == "nt":
+                    os.startfile(str(domain_file))  # type: ignore[attr-defined]
+                elif sys.platform == "darwin":
+                    subprocess.run(["open", str(domain_file)], check=False)
+                else:
+                    subprocess.run(["xdg-open", str(domain_file)], check=False)
+
+        ttk.Button(btns, text=self._tr("open_output"), command=open_suggested_file).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btns, text="domain_cookies.json", command=open_domain_cookies_file).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btns, text=self._tr("cancel_btn"), command=dialog.destroy).pack(side=tk.RIGHT)
 
     def _on_close(self) -> None:
         if self.proc is not None and self.proc.poll() is None:
