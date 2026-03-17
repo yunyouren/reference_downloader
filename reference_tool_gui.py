@@ -83,7 +83,12 @@ I18N = {
         "move_up": "上移",
         "move_down": "下移",
         "invalid_url_template": "无效 URL 模板",
-        "enable_verify_rename_first": "请先启用“校验并重命名”。",
+        "enable_verify_rename_first": "请先启用【校验并重命名】。",
+        "lookup_timeout": "检索超时",
+        "neurips_proceedings": "NeurIPS 注入",
+        "unpaywall_email": "Unpaywall 邮箱",
+        "preset_speed": "速度优先",
+        "preset_qos": "质量优先",
     },
     "en": {
         "title": "Reference Tool GUI",
@@ -140,6 +145,11 @@ I18N = {
         "move_down": "Move Down",
         "invalid_url_template": "invalid URL template",
         "enable_verify_rename_first": "Please enable verify_rename first.",
+        "lookup_timeout": "Lookup Timeout",
+        "neurips_proceedings": "NeurIPS Injection",
+        "unpaywall_email": "Unpaywall Email",
+        "preset_speed": "Speed Priority",
+        "preset_qos": "Quality Priority",
     },
 }
 
@@ -220,6 +230,9 @@ def build_parameter_help_text(lang: str = "en") -> str:
             "secondary_lookup: 失败条目启用二次检索（Crossref/OpenAlex）。\n"
             "secondary_max: 二次检索最多处理多少失败条目。\n"
             "secondary_top_k: 二次检索每条保留前 K 个候选。\n"
+            "lookup_timeout: 二次检索 API 超时时间（秒）。\n"
+            "neurips_proceedings: 启用 NeurIPS 论文集 PDF 注入。\n"
+            "unpaywall_email: Unpaywall API 邮箱（用于开放获取查询）。\n"
             "max_candidates: 每条参考文献最多尝试多少候选链接。\n"
             "workers: 并发下载线程数。\n"
             "timeout: 单次请求超时（秒）。\n"
@@ -232,11 +245,12 @@ def build_parameter_help_text(lang: str = "en") -> str:
             "  number_only: 仅保留参考文献编号（如 001.pdf）。\n"
             "  number_and_original: 编号+原始标题（如 001 xxx.pdf）。\n"
             "\n"
-            "默认推荐参数\n"
+            "预设模式\n"
             "------------------------------\n"
-            "pdf_parser=pdfplumber（未安装时自动回退 pypdf），\n"
-            "secondary_lookup=true，secondary_max=60，secondary_top_k=3，\n"
-            "max_candidates=5，retries=2，timeout=25。\n"
+            "速度优先: neurips_proceedings=false, secondary_max=30,\n"
+            "  workers=4, lookup_timeout=5, secondary_top_k=2\n"
+            "质量优先: neurips_proceedings=true, secondary_max=60,\n"
+            "  workers=4, lookup_timeout=5, secondary_top_k=2\n"
         )
     return (
         "Parameter Guide\n"
@@ -245,6 +259,9 @@ def build_parameter_help_text(lang: str = "en") -> str:
         "secondary_lookup: retry failed refs via Crossref/OpenAlex.\n"
         "secondary_max: max failed refs to process in secondary phase.\n"
         "secondary_top_k: keep top-K lookup candidates per ref.\n"
+        "lookup_timeout: secondary lookup API timeout (seconds).\n"
+        "neurips_proceedings: enable NeurIPS proceedings PDF injection.\n"
+        "unpaywall_email: email for Unpaywall API (open access lookup).\n"
         "max_candidates: max URL/DOI attempts per reference.\n"
         "workers: concurrent download workers.\n"
         "timeout: per-request timeout in seconds.\n"
@@ -257,11 +274,12 @@ def build_parameter_help_text(lang: str = "en") -> str:
         "  number_only: only keep reference number (e.g., 001.pdf).\n"
         "  number_and_original: number + original title (e.g., 001 xxx.pdf).\n"
         "\n"
-        "Recommended Defaults\n"
+        "Preset Modes\n"
         "------------------------------\n"
-        "pdf_parser=pdfplumber (fallback to pypdf if missing),\n"
-        "secondary_lookup=true, secondary_max=60, secondary_top_k=3,\n"
-        "max_candidates=5, retries=2, timeout=25.\n"
+        "Speed Priority: neurips_proceedings=false, secondary_max=30,\n"
+        "  workers=4, lookup_timeout=5, secondary_top_k=2\n"
+        "Quality Priority: neurips_proceedings=true, secondary_max=60,\n"
+        "  workers=4, lookup_timeout=5, secondary_top_k=2\n"
     )
 
 
@@ -470,6 +488,9 @@ class ReferenceToolGUI:
         self.secondary_lookup_var = tk.BooleanVar(value=False)
         self.secondary_max_var = tk.StringVar(value="40")
         self.secondary_top_k_var = tk.StringVar(value="2")
+        self.lookup_timeout_var = tk.StringVar(value="6")
+        self.neurips_proceedings_var = tk.BooleanVar(value=True)
+        self.unpaywall_email_var = tk.StringVar(value="")
         self.verify_rename_var = tk.BooleanVar(value=False)
         self.verify_rename_mode_var = tk.StringVar(value=rename_mode_value_to_label("number_and_original", self.lang_var.get()))
         self.verify_threshold_var = tk.StringVar(value="0.55")
@@ -534,6 +555,12 @@ class ReferenceToolGUI:
             self.lbl_secondary_max.configure(text=self._tr("secondary_max"))
         if hasattr(self, "lbl_secondary_top_k"):
             self.lbl_secondary_top_k.configure(text=self._tr("secondary_top_k"))
+        if hasattr(self, "lbl_lookup_timeout"):
+            self.lbl_lookup_timeout.configure(text=self._tr("lookup_timeout"))
+        if hasattr(self, "chk_neurips_proceedings"):
+            self.chk_neurips_proceedings.configure(text=self._tr("neurips_proceedings"))
+        if hasattr(self, "lbl_unpaywall_email"):
+            self.lbl_unpaywall_email.configure(text=self._tr("unpaywall_email"))
         if hasattr(self, "chk_verify_rename"):
             self.chk_verify_rename.configure(text=self._tr("verify_rename"))
         if hasattr(self, "lbl_rename_mode"):
@@ -546,8 +573,10 @@ class ReferenceToolGUI:
             self.load_btn.configure(text=self._tr("load"))
         if hasattr(self, "save_btn"):
             self.save_btn.configure(text=self._tr("save"))
-        if hasattr(self, "recommend_btn"):
-            self.recommend_btn.configure(text=self._tr("recommend"))
+        if hasattr(self, "speed_btn"):
+            self.speed_btn.configure(text=self._tr("preset_speed"))
+        if hasattr(self, "qos_btn"):
+            self.qos_btn.configure(text=self._tr("preset_qos"))
         if hasattr(self, "edit_generic_sites_btn"):
             self.edit_generic_sites_btn.configure(text=self._tr("edit_generic_sites"))
         if hasattr(self, "rename_only_btn"):
@@ -681,18 +710,29 @@ class ReferenceToolGUI:
         self.lbl_secondary_top_k = ttk.Label(row3, text=self._tr("secondary_top_k"))
         self.lbl_secondary_top_k.pack(side=tk.LEFT)
         ttk.Entry(row3, textvariable=self.secondary_top_k_var, width=8).pack(side=tk.LEFT, padx=(4, 10))
-        self.chk_verify_rename = ttk.Checkbutton(row3, text=self._tr("verify_rename"), variable=self.verify_rename_var)
-        self.chk_verify_rename.pack(side=tk.LEFT, padx=(12, 10))
-        self.lbl_rename_mode = ttk.Label(row3, text=self._tr("rename_mode"))
+        self.lbl_lookup_timeout = ttk.Label(row3, text=self._tr("lookup_timeout"))
+        self.lbl_lookup_timeout.pack(side=tk.LEFT)
+        ttk.Entry(row3, textvariable=self.lookup_timeout_var, width=6).pack(side=tk.LEFT, padx=(4, 10))
+        self.chk_neurips_proceedings = ttk.Checkbutton(row3, text=self._tr("neurips_proceedings"), variable=self.neurips_proceedings_var)
+        self.chk_neurips_proceedings.pack(side=tk.LEFT, padx=(4, 10))
+
+        row4 = ttk.Frame(left)
+        row4.pack(fill=tk.X, pady=(6, 0))
+        self.chk_verify_rename = ttk.Checkbutton(row4, text=self._tr("verify_rename"), variable=self.verify_rename_var)
+        self.chk_verify_rename.pack(side=tk.LEFT, padx=(0, 10))
+        self.lbl_rename_mode = ttk.Label(row4, text=self._tr("rename_mode"))
         self.lbl_rename_mode.pack(side=tk.LEFT)
         self.rename_mode_combo = ttk.Combobox(
-            row3,
+            row4,
             textvariable=self.verify_rename_mode_var,
             values=rename_mode_labels_for_lang(self.lang_var.get()),
             state="readonly",
             width=20,
         )
-        self.rename_mode_combo.pack(side=tk.LEFT, padx=(4, 6))
+        self.rename_mode_combo.pack(side=tk.LEFT, padx=(4, 20))
+        self.lbl_unpaywall_email = ttk.Label(row4, text=self._tr("unpaywall_email"))
+        self.lbl_unpaywall_email.pack(side=tk.LEFT)
+        ttk.Entry(row4, textvariable=self.unpaywall_email_var, width=25).pack(side=tk.LEFT, padx=(4, 6))
 
         actions = ttk.Frame(left)
         actions.pack(fill=tk.X, pady=(8, 0))
@@ -705,8 +745,10 @@ class ReferenceToolGUI:
         self.load_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.save_btn = ttk.Button(actions, text=self._tr("save"), command=self._save_config)
         self.save_btn.pack(side=tk.LEFT, padx=(0, 6))
-        self.recommend_btn = ttk.Button(actions, text=self._tr("recommend"), command=self._apply_recommended_preset)
-        self.recommend_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.speed_btn = ttk.Button(actions, text=self._tr("preset_speed"), command=self._apply_speed_preset)
+        self.speed_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.qos_btn = ttk.Button(actions, text=self._tr("preset_qos"), command=self._apply_recommended_preset)
+        self.qos_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.edit_generic_sites_btn = ttk.Button(actions, text=self._tr("edit_generic_sites"), command=self._edit_generic_download_sites)
         self.edit_generic_sites_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.rename_only_btn = ttk.Button(actions, text=self._tr("rename_only"), command=self._rename_only)
@@ -961,13 +1003,22 @@ class ReferenceToolGUI:
             "secondary_lookup": bool(self.secondary_lookup_var.get()),
             "secondary_max": int(self.secondary_max_var.get()),
             "secondary_top_k": int(self.secondary_top_k_var.get()),
+            "lookup_timeout": int(self.lookup_timeout_var.get()),
+            "neurips_proceedings": "true" if self.neurips_proceedings_var.get() else "false",
+            "unpaywall_email": self.unpaywall_email_var.get().strip(),
             "verify_title_rename": bool(self.verify_rename_var.get()),
             "verify_rename_mode": self._current_rename_mode_value(),
             "verify_title_threshold": threshold,
             "interactive": "false",
         }
 
-    def _apply_recommended_defaults(self, *, notify_if_fallback: bool) -> None:
+    def _apply_recommended_defaults(self, *, notify_if_fallback: bool, mode: str = "quality") -> None:
+        """Apply recommended preset.
+
+        Args:
+            notify_if_fallback: Show warning if pdfplumber is not available
+            mode: "speed" for speed priority, "quality" for quality priority
+        """
         preset = recommended_download_preset()
         parser = str(preset["pdf_parser"])
         if parser == "pdfplumber" and not is_pdfplumber_available():
@@ -980,8 +1031,6 @@ class ReferenceToolGUI:
                 )
         self.pdf_parser_var.set(parser)
         self.secondary_lookup_var.set(bool(preset["secondary_lookup"]))
-        self.secondary_max_var.set(str(preset["secondary_max"]))
-        self.secondary_top_k_var.set(str(preset["secondary_top_k"]))
         self.max_candidates_var.set(str(preset["max_candidates_per_item"]))
         self.retries_var.set(str(preset["retries"]))
         self.timeout_var.set(str(preset["timeout"]))
@@ -989,8 +1038,27 @@ class ReferenceToolGUI:
         if isinstance(generic_sites, list):
             self.generic_download_sites = [str(x).strip() for x in generic_sites if str(x).strip()]
 
+        # Apply mode-specific settings
+        if mode == "speed":
+            # Speed priority: disable NeurIPS injection, lower secondary_max
+            self.secondary_max_var.set("30")
+            self.secondary_top_k_var.set("2")
+            self.lookup_timeout_var.set("5")
+            self.neurips_proceedings_var.set(False)
+            self.workers_var.set("4")
+        else:
+            # Quality priority: enable NeurIPS injection, higher secondary_max
+            self.secondary_max_var.set("60")
+            self.secondary_top_k_var.set("2")
+            self.lookup_timeout_var.set("5")
+            self.neurips_proceedings_var.set(True)
+            self.workers_var.set("4")
+
     def _apply_recommended_preset(self) -> None:
-        self._apply_recommended_defaults(notify_if_fallback=True)
+        self._apply_recommended_defaults(notify_if_fallback=True, mode="quality")
+
+    def _apply_speed_preset(self) -> None:
+        self._apply_recommended_defaults(notify_if_fallback=True, mode="speed")
 
     def _run(self) -> None:
         if self.proc is not None and self.proc.poll() is None:
@@ -1140,6 +1208,10 @@ class ReferenceToolGUI:
             self.secondary_lookup_var.set(bool(data.get("secondary_lookup", self.secondary_lookup_var.get())))
             self.secondary_max_var.set(str(data.get("secondary_max", self.secondary_max_var.get())))
             self.secondary_top_k_var.set(str(data.get("secondary_top_k", self.secondary_top_k_var.get())))
+            self.lookup_timeout_var.set(str(data.get("lookup_timeout", self.lookup_timeout_var.get())))
+            neurips_val = str(data.get("neurips_proceedings", "true")).lower() == "true"
+            self.neurips_proceedings_var.set(neurips_val)
+            self.unpaywall_email_var.set(str(data.get("unpaywall_email", self.unpaywall_email_var.get())))
             self.verify_rename_var.set(bool(data.get("verify_title_rename", self.verify_rename_var.get())))
             self._set_rename_mode_from_value(str(data.get("verify_rename_mode", self._current_rename_mode_value())))
             self.verify_threshold_var.set(str(data.get("verify_title_threshold", self.verify_threshold_var.get())))

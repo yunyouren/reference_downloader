@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "domains": {
+    "link.aps.org": {
+      "cookies_path": "cookies/aps.json",
+      "description": "APS Journals (Physical Review)"
+    },
+    "journals.aps.org": {
+      "cookies_path": "cookies/aps.json",
+      "description": "APS Journals (Physical Review)"
+    },
+    "pubs.acs.org": {
+      "cookies_path": "cookies/acs.json",
+      "description": "ACS Publications"
+    },
+    "pubs.aip.org": {
+      "cookies_path": "cookies/aip.json",
+      "description": "AIP Publishing"
+    },
+    "scitation.aip.org": {
+      "cookies_path": "cookies/aip.json",
+      "description": "AIP Scitation"
+    },
+    "arc.aiaa.org": {
+      "cookies_path": "cookies/aiaa.json",
+      "description": "AIAA ARC"
+    },
+    "www.cambridge.org": {
+      "cookies_path": "cookies/cambridge.json",
+      "description": "Cambridge Core"
+    },
+    "cambridge.org": {
+      "cookies_path": "cookies/cambridge.json",
+      "description": "Cambridge Core"
+    },
+    "royalsocietypublishing.org": {
+      "cookies_path": "cookies/royalsociety.json",
+      "description": "Royal Society Publishing"
+    },
+    "www.annualreviews.org": {
+      "cookies_path": "cookies/annualreviews.json",
+      "description": "Annual Reviews"
+    },
+    "asmedigitalcollection.asme.org": {
+      "cookies_path": "cookies/asme.json",
+      "description": "ASME Digital Collection"
+    },
+    "www.science.org": {
+      "cookies_path": "cookies/science.json",
+      "description": "Science (AAAS)"
+    },
+    "iopscience.iop.org": {
+      "cookies_path": "cookies/iop.json",
+      "description": "IOP Science"
+    },
+    "link.springer.com": {
+      "cookies_path": "cookies/springer.json",
+      "description": "Springer Link"
+    },
+    "www.nature.com": {
+      "cookies_path": "cookies/nature.json",
+      "description": "Nature"
+    },
+    "www.sciencedirect.com": {
+      "cookies_path": "cookies/elsevier.json",
+      "description": "ScienceDirect (Elsevier)"
+    },
+    "linkinghub.elsevier.com": {
+      "cookies_path": "cookies/elsevier.json",
+      "description": "Elsevier"
+    },
+    "onlinelibrary.wiley.com": {
+      "cookies_path": "cookies/wiley.json",
+      "description": "Wiley Online Library"
+    },
+    "www.tandfonline.com": {
+      "cookies_path": "cookies/taylor.json",
+      "description": "Taylor & Francis"
+    }
+  }
+}
