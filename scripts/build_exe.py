@@ -22,7 +22,7 @@ BUILD_DIR = ROOT_DIR / "build"
 # 需要包含的数据文件
 DATA_FILES = [
     ("domain_cookies.json", "."),
-    ("reference_tool.config.example.json", "."),
+    ("config/reference_tool.config.example.json", "."),
     ("README.md", "."),
     ("docs/cookies_setup_guide.md", "."),
 ]
@@ -210,9 +210,9 @@ def create_release_package():
     # 复制配置文件
     config_files = [
         "domain_cookies.json",
-        "reference_tool.config.example.json",
-        "README_reference_tool.md",
-        "cookies_setup_guide.md",
+        "config/reference_tool.config.example.json",
+        "README.md",
+        "docs/cookies_setup_guide.md",
     ]
 
     for f in config_files:

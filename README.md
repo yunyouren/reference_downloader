@@ -42,7 +42,7 @@ python reference_tool.py --input "你的论文.pdf" --output references_output \
 1. 复制配置模板：
 
 ```bash
-copy reference_tool.config.example.json reference_tool.config.json
+copy config\reference_tool.config.example.json reference_tool.config.json
 ```
 
 2. 编辑 `reference_tool.config.json`，设置输入文件和参数
@@ -164,8 +164,9 @@ references_output/
 .
 ├── reference_tool.py              # 命令行主程序
 ├── reference_tool_gui.py          # GUI 主程序
-├── reference_tool.config.example.json  # 配置模板
-├── src/                           # 内部模块
+├── config/                           # 配置模板
+│   └── reference_tool.config.example.json
+├── src/                               # 内部模块
 │   └── interactive_ui.py
 ├── core/                          # 核心工具模块
 │   ├── http.py
