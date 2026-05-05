@@ -4,7 +4,7 @@ param(
 )
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-Set-Location $scriptDir
+Set-Location (Split-Path -Parent $scriptDir)
 
 if (-Not (Test-Path $Config)) {
   if (Test-Path "reference_tool.config.example.json") {

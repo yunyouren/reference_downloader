@@ -15,7 +15,7 @@ import shutil
 from pathlib import Path
 
 # 项目根目录
-ROOT_DIR = Path(__file__).parent.resolve()
+ROOT_DIR = Path(__file__).parent.parent.resolve()
 DIST_DIR = ROOT_DIR / "dist"
 BUILD_DIR = ROOT_DIR / "build"
 
@@ -23,8 +23,8 @@ BUILD_DIR = ROOT_DIR / "build"
 DATA_FILES = [
     ("domain_cookies.json", "."),
     ("reference_tool.config.example.json", "."),
-    ("README_reference_tool.md", "."),
-    ("cookies_setup_guide.md", "."),
+    ("README.md", "."),
+    ("docs/cookies_setup_guide.md", "."),
 ]
 
 # 需要包含的目录

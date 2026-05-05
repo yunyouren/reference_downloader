@@ -121,7 +121,7 @@ references_output/
 }
 ```
 
-详细配置说明见 [cookies_setup_guide.md](cookies_setup_guide.md)。
+详细配置说明见 [docs/cookies_setup_guide.md](docs/cookies_setup_guide.md)。
 
 ### 常用参数说明
 
@@ -162,25 +162,28 @@ references_output/
 
 ```
 .
-├── reference_tool.py          # 命令行主程序
-├── reference_tool_gui.py      # GUI 主程序
-├── build_exe.py               # 打包脚本
-├── reference_tool.config.json # 配置文件
-├── domain_cookies.json        # 域名 Cookies 映射
-├── core/                      # 核心工具模块
-│   ├── http.py                # HTTP 工具函数
-│   ├── html.py                # HTML 解析工具
-│   ├── urls.py                # URL 处理工具
-│   └── verify.py              # PDF 校验工具
-├── site_handlers/             # 站点适配器
-│   ├── registry.py            # Handler 注册与分发
-│   ├── springer.py            # Springer 站点适配
-│   ├── ieee.py                # IEEE 站点适配
-│   └── domain_analyzer.py     # 域名分析工具
-├── cookies/                   # 预置 Cookies 模板目录
-├── tests/                     # 单元测试
-└── dist/                      # 打包输出目录
-    └── ReferenceTool.exe      # 可执行文件
+├── reference_tool.py              # 命令行主程序
+├── reference_tool_gui.py          # GUI 主程序
+├── interactive_ui.py              # 交互式 UI 模块
+├── reference_tool.config.example.json  # 配置模板
+├── core/                          # 核心工具模块
+│   ├── http.py
+│   ├── html.py
+│   ├── urls.py
+│   └── verify.py
+├── site_handlers/                 # 站点适配器
+│   ├── registry.py
+│   ├── springer.py
+│   ├── ieee.py
+│   └── domain_analyzer.py
+├── scripts/                       # 构建与启动脚本
+│   ├── build_exe.py
+│   └── run_reference_tool.ps1
+├── docs/                          # 文档
+│   └── cookies_setup_guide.md
+├── tests/                         # 单元测试
+├── cookies/                       # 机构 Cookies（不入 git）
+└── dist/                          # 打包输出（不入 git）
 ```
 
 ## 开发指南
@@ -209,7 +212,7 @@ def extract_new_site_pdf_url(html: str, url: str) -> str | None:
 
 ```bash
 pip install pyinstaller
-python build_exe.py
+python scripts/build_exe.py
 ```
 
 打包后的文件位于 `dist/ReferenceTool_Release/` 目录。

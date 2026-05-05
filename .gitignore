@@ -31,7 +31,15 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-# Generated outputs from this tool
-references_output*/
+# Sensitive config / auth
+cookies/
 cookies.txt
+reference_tool.config.json
+domain_cookies.json
+.claude/
+
+# Generated outputs
+references_output*/
+
+# Documents
 *.pdf
