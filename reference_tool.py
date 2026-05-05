@@ -4045,7 +4045,7 @@ def main() -> None:
 
     # 3) 域名分析与交互式配置
     from site_handlers.domain_analyzer import analyze_reference_domains
-    from interactive_ui import should_run_interactive, display_domain_summary, configure_cookies_interactively
+    from src.interactive_ui import should_run_interactive, display_domain_summary, configure_cookies_interactively
 
     # 加载域名cookies配置
     domain_cookies_file = Path(getattr(args, "domain_cookies_file", "domain_cookies.json"))

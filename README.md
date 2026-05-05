@@ -164,8 +164,9 @@ references_output/
 .
 ├── reference_tool.py              # 命令行主程序
 ├── reference_tool_gui.py          # GUI 主程序
-├── interactive_ui.py              # 交互式 UI 模块
 ├── reference_tool.config.example.json  # 配置模板
+├── src/                           # 内部模块
+│   └── interactive_ui.py
 ├── core/                          # 核心工具模块
 │   ├── http.py
 │   ├── html.py
