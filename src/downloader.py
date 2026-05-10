@@ -32,7 +32,7 @@ from requests.adapters import HTTPAdapter  # type: ignore[import-untyped]
 
 import site_handlers
 from core.http import is_probably_pdf, parse_retry_after_seconds, should_record_landing_url
-from core.html import extract_springer_pdf_url, extract_ieee_arnumber, extract_ieee_pdf_url
+from core.html import extract_springer_pdf_url, extract_chinese_journal_pdf_url, extract_ieee_arnumber, extract_ieee_pdf_url
 from core.urls import normalize_candidate_url
 from core.verify import (
     build_verified_pdf_name,
@@ -569,6 +569,7 @@ def try_download(
                             "is_probably_pdf": is_probably_pdf,
                             "verify_downloaded_pdf_and_update_item": verify_downloaded_pdf_and_update_item,
                             "extract_springer_pdf_url": extract_springer_pdf_url,
+                            "extract_chinese_journal_pdf_url": extract_chinese_journal_pdf_url,
                             "extract_ieee_arnumber": extract_ieee_arnumber,
                             "extract_ieee_pdf_url": extract_ieee_pdf_url,
                             "DownloadAttempt": DownloadAttempt,

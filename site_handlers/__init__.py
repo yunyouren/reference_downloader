@@ -9,6 +9,7 @@ from .registry import HandlerResult
 
 from . import ieee as _ieee
 from . import springer as _springer
+from . import chinese_journals as _chinese_journals  # noqa: F401
 
 
 def dispatch_html(
