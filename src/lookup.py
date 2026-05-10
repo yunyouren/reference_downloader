@@ -650,47 +650,6 @@ def lookup_europepmc_pdf_urls_by_title(
     except Exception:
         return []
 
-
-def lookup_semanticscholar_pdf_urls_by_title(
-    session: requests.Session,
-    expected_title: str,
-    timeout: int,
-) -> list[str]:
-    """通过标题搜索 Semantic Scholar 开放获取 PDF。"""
-    title = (expected_title or "").strip().strip(" \t\r\n,.;:，。；：")
-    if not title:
-        return []
-    try:
-        res = session.get(
-            "https://api.semanticscholar.org/graph/v1/paper/search",
-            params={
-                "query": title,
-                "limit": 5,
-                "fields": "title,openAccessPdf",
-            },
-            timeout=timeout,
-        )
-        if not res.ok:
-            return []
-        data = res.json()
-        out: list[tuple[float, str]] = []
-
-        for item in data.get("data", []):
-            item_title = (item.get("title") or "").strip()
-            score = secondary_title_score(item_title, title)
-            if score < 0.5:
-                continue
-
-            oa_pdf = item.get("openAccessPdf", {})
-            if oa_pdf and oa_pdf.get("url"):
-                out.append((score, oa_pdf["url"]))
-
-        out.sort(key=lambda x: x[0], reverse=True)
-        return unique_preserve_order([u for _, u in out])
-    except Exception:
-        return []
-
-
 def lookup_core_pdf_urls_by_title(
     session: requests.Session,
     expected_title: str,

@@ -1,5 +1,12 @@
 """Tests for URL candidate generation and DOI template mapping."""
 from src._doi_templates import build_doi_candidate, DOI_URL_TEMPLATES
+from src.candidates import (
+    normalize_generic_download_sites,
+    build_generic_site_candidates,
+    resolve_downloads_subdir,
+)
+from src.models import ReferenceItem
+from pathlib import Path
 
 
 class TestBuildDoiCandidate:
@@ -82,3 +89,80 @@ class TestDoiUrlTemplates:
 
     def test_template_count(self):
         assert len(DOI_URL_TEMPLATES) >= 20, "Should have at least 20 publisher mappings"
+
+
+class TestNormalizeGenericDownloadSites:
+    def test_none_returns_empty(self):
+        assert normalize_generic_download_sites(None) == []
+
+    def test_string_with_commas(self):
+        result = normalize_generic_download_sites(
+            "https://sci-hub.se/{doi}, https://example.org/search?q={title_encoded}"
+        )
+        assert len(result) == 2
+        assert result[0] == "https://sci-hub.se/{doi}"
+
+    def test_list_input(self):
+        result = normalize_generic_download_sites([
+            "https://sci-hub.se/{doi}",
+            "https://example.org/search?q={title_encoded}",
+        ])
+        assert len(result) == 2
+
+    def test_filters_non_http(self):
+        result = normalize_generic_download_sites(["ftp://files.com", "not-a-url"])
+        assert result == []
+
+    def test_deduplicates(self):
+        result = normalize_generic_download_sites([
+            "https://example.com/a",
+            "https://example.com/a",
+            "https://example.com/b",
+        ])
+        assert result == ["https://example.com/a", "https://example.com/b"]
+
+    def test_filters_empty(self):
+        result = normalize_generic_download_sites(["", "https://example.com", ""])
+        assert result == ["https://example.com"]
+
+    def test_non_string_non_list(self):
+        assert normalize_generic_download_sites(12345) == []
+
+
+class TestBuildGenericSiteCandidates:
+    def test_expands_doi_placeholder(self):
+        item = ReferenceItem(number=1, text="A sample paper", dois=["10.1000/abc"], urls=[])
+        result = build_generic_site_candidates(item, ["https://sci-hub.se/{doi}"])
+        assert len(result) == 1
+        assert "10.1000/abc" in result[0]
+
+    def test_expands_title_placeholder(self):
+        item = ReferenceItem(number=1, text="Grid Stability Analysis", dois=[], urls=[])
+        result = build_generic_site_candidates(
+            item, ["https://example.org/search?q={title_encoded}"]
+        )
+        assert len(result) == 1
+        assert "Grid" in result[0] or "grid" in result[0].lower()
+
+    def test_no_sites_returns_empty(self):
+        item = ReferenceItem(number=1, text="text", dois=["10.1000/abc"], urls=[])
+        result = build_generic_site_candidates(item, None)
+        assert result == []
+
+    def test_deduplicates_results(self):
+        item = ReferenceItem(number=1, text="text", dois=["10.1000/abc"], urls=[])
+        result = build_generic_site_candidates(item, [
+            "https://sci-hub.se/{doi}",
+            "https://sci-hub.se/{doi}",
+        ])
+        assert len(result) == 1
+
+
+class TestResolveDownloadsSubdir:
+    def test_normal_subdir(self):
+        result = resolve_downloads_subdir(Path("/tmp/dl"), "meta")
+        assert result == Path("/tmp/dl/meta")
+
+    def test_empty_subdir(self):
+        assert resolve_downloads_subdir(Path("/tmp/dl"), "") is None
+        assert resolve_downloads_subdir(Path("/tmp/dl"), "  ") is None
