@@ -63,6 +63,7 @@ from core.verify import (
     unique_path,
     verify_and_rename_pdf,
 )
+from src._doi_templates import build_doi_candidate
 
 try:
     from pypdf import PdfReader
@@ -1788,103 +1789,10 @@ def iter_candidate_urls(item: ReferenceItem, use_doi: bool = True) -> Iterable[s
             if not d:
                 continue
             d_lower = d.lower()
-
-            # Springer - 直接 PDF 链接
-            if d_lower.startswith("10.1007/"):
-                yield f"https://link.springer.com/content/pdf/{quote(d, safe='')}.pdf"
-
-            # IOP Science - 直接 PDF 链接
-            elif d_lower.startswith("10.1088/"):
-                yield f"https://iopscience.iop.org/article/{quote(d, safe='')}/pdf"
-
-            # AIP Publishing - 直接 PDF 链接
-            elif d_lower.startswith("10.1063/"):
-                yield f"https://pubs.aip.org/aip/pdf/article/{quote(d, safe='')}/pdf"
-
-            # APS (Physical Review) - 直接 PDF 链接
-            elif d_lower.startswith("10.1103/"):
-                yield f"https://journals.aps.org/prl/pdf/{quote(d, safe='')}"
-
-            # Royal Society - 直接 PDF 链接
-            elif d_lower.startswith("10.1098/"):
-                yield f"https://royalsocietypublishing.org/doi/pdf/{quote(d, safe='')}"
-
-            # Cambridge - 直接 PDF 链接
-            elif d_lower.startswith("10.1017/"):
-                yield f"https://www.cambridge.org/core/services/aop-cambridge-core/content/view/{quote(d, safe='')}"
-
-            # Nature - 直接 PDF 链接
-            elif d_lower.startswith("10.1038/"):
-                yield f"https://www.nature.com/articles/{quote(d, safe='')}.pdf"
-
-            # Science - 直接 PDF 链接
-            elif d_lower.startswith("10.1126/"):
-                yield f"https://www.science.org/doi/pdf/{quote(d, safe='')}"
-
-            # Wiley - 直接 PDF 链接
-            elif d_lower.startswith("10.1002/"):
-                yield f"https://onlinelibrary.wiley.com/doi/pdfdirect/{quote(d, safe='')}"
-
-            # Taylor & Francis - 直接 PDF 链接
-            elif d_lower.startswith("10.1080/"):
-                yield f"https://www.tandfonline.com/doi/pdf/{quote(d, safe='')}"
-
-            # Elsevier/ScienceDirect - 直接 PDF 链接
-            elif d_lower.startswith("10.1016/"):
-                yield f"https://www.sciencedirect.com/science/article/pii/{quote(d.split('/')[-1], safe='')}/pdfft"
-
-            # Annual Reviews - 直接 PDF 链接
-            elif d_lower.startswith("10.1146/"):
-                yield f"https://www.annualreviews.org/doi/pdf/{quote(d, safe='')}"
-
-            # ACS Publications - 直接 PDF 链接
-            elif d_lower.startswith("10.1021/"):
-                yield f"https://pubs.acs.org/doi/pdf/{quote(d, safe='')}"
-
-            # IEEE - 直接 PDF 链接
-            elif d_lower.startswith("10.1109/"):
-                # IEEE DOI 格式: 10.1109/xxx.202x.xxxxxxx
-                yield f"https://ieeexplore.ieee.org/document/{quote(d.split('/')[-1], safe='')}"
-
-            # ACM Digital Library - 直接 PDF 链接
-            elif d_lower.startswith("10.1145/"):
-                yield f"https://dl.acm.org/doi/pdf/{quote(d, safe='')}"
-
-            # Oxford University Press - 直接 PDF 链接
-            elif d_lower.startswith("10.1093/"):
-                yield f"https://academic.oup.com/article-pdf/{quote(d, safe='')}"
-
-            # PNAS - 直接 PDF 链接
-            elif d_lower.startswith("10.1073/"):
-                yield f"https://www.pnas.org/doi/pdf/{quote(d, safe='')}"
-
-            # PLoS - 直接 PDF 链接
-            elif d_lower.startswith("10.1371/"):
-                yield f"https://journals.plos.org/plosone/article/file?id={quote(d, safe='')}&type=printable"
-
-            # JSTOR - 直接 PDF 链接
-            elif d_lower.startswith("10.2307/"):
-                jstor_id = d.split("/")[-1]
-                yield f"https://www.jstor.org/stable/pdf/{quote(jstor_id, safe='')}.pdf"
-
-            # Frontiers - 直接 PDF 链接
-            elif d_lower.startswith("10.3389/"):
-                yield f"https://www.frontiersin.org/articles/{quote(d, safe='')}/pdf"
-
-            # MDPI - 直接 PDF 链接
-            elif d_lower.startswith("10.3390/"):
-                yield f"https://www.mdpi.com/{quote(d, safe='')}/pdf"
-
-            # Hindawi - 直接 PDF 链接
-            elif d_lower.startswith("10.1155/"):
-                yield f"https://downloads.hindawi.com/journals/{quote(d, safe='')}.pdf"
-
-            # arXiv DOI (10.48550/arXiv.xxxx)
-            elif d_lower.startswith("10.48550/"):
-                arxiv_id = d.split("/")[-1]
-                yield f"https://arxiv.org/pdf/{quote(arxiv_id, safe='')}.pdf"
-
-            # 最后尝试通用 DOI 解析
+            candidate = build_doi_candidate(d)
+            if candidate is not None:
+                yield candidate
+            # Always fall back to generic DOI resolution
             yield f"https://doi.org/{quote(d, safe=':/')}"
 
 
