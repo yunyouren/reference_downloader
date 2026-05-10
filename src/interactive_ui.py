@@ -259,7 +259,8 @@ def display_download_summary(
     print("下载结果摘要")
     print("=" * 50)
     print(f"总计: {total}篇参考文献")
-    print(f"  PDF下载成功: {downloaded}篇 ({downloaded/total*100:.1f}%)")
+    pct = (downloaded / total * 100) if total > 0 else 0.0
+    print(f"  PDF下载成功: {downloaded}篇 ({pct:.1f}%)")
     print(f"  落地页保存: {landing}篇")
     print(f"  下载失败: {failed}篇")
 

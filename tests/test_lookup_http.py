@@ -12,6 +12,14 @@ from src.lookup import (
     lookup_unpaywall,
     lookup_core_pdf_urls_by_title,
     lookup_secondary_ranked,
+    lookup_neurips_proceedings_pdf_urls_by_title,
+    lookup_google_books_pdf_urls,
+    lookup_crossref_tdm_urls,
+    lookup_ssrn_pdf_urls_by_title,
+    lookup_chemrxiv_pdf_urls_by_title,
+    lookup_researchgate_pdf_urls_by_title,
+    lookup_unpaywall_by_title,
+    lookup_openalex_pdf_urls_by_title,
 )
 from src.models import ReferenceItem, DomainLimiter
 
@@ -319,6 +327,315 @@ class TestLookupSecondaryRanked(unittest.TestCase):
         # Should not raise, return empty
         self.assertEqual(dois, [])
         self.assertEqual(urls, [])
+
+
+# ---------------------------------------------------------------------------
+# lookup_neurips_proceedings_pdf_urls_by_title
+# ---------------------------------------------------------------------------
+
+class TestLookupNeurips(unittest.TestCase):
+    def test_empty_title(self):
+        session = _make_session()
+        self.assertEqual(lookup_neurips_proceedings_pdf_urls_by_title(session, "", None, timeout=5), [])
+
+    def test_non_200(self):
+        session = _make_session(ok=False, status_code=500)
+        self.assertEqual(lookup_neurips_proceedings_pdf_urls_by_title(session, "title", None, timeout=5), [])
+
+    def test_connection_error(self):
+        session = MagicMock()
+        session.get.side_effect = requests.ConnectionError("fail")
+        self.assertEqual(lookup_neurips_proceedings_pdf_urls_by_title(session, "title", None, timeout=5), [])
+
+    def test_finds_matching_paper(self):
+        search_html = '<a href="/paper/2023/hash/Abstract-Conference.html">Link</a>'
+        page_html = (
+            '<meta name="citation_title" content="A Fast Method for Power Converter Simulation">'
+            '<meta name="citation_pdf_url" content="https://proceedings.neurips.cc/paper.pdf">'
+        )
+        mock_resp_search = MagicMock()
+        mock_resp_search.ok = True
+        mock_resp_search.text = search_html
+        mock_resp_page = MagicMock()
+        mock_resp_page.ok = True
+        mock_resp_page.text = page_html
+        session = MagicMock()
+        session.get.side_effect = [mock_resp_search, mock_resp_page]
+        result = lookup_neurips_proceedings_pdf_urls_by_title(
+            session, "A Fast Method for Power Converter Simulation", None, timeout=5
+        )
+        self.assertEqual(result, ["https://proceedings.neurips.cc/paper.pdf"])
+
+
+# ---------------------------------------------------------------------------
+# lookup_google_books_pdf_urls
+# ---------------------------------------------------------------------------
+
+class TestLookupGoogleBooks(unittest.TestCase):
+    def test_finds_pdf_download_link(self):
+        session = _make_session(json_data={
+            "items": [
+                {
+                    "volumeInfo": {"title": "A Fast Method for Power Converter Simulation"},
+                    "accessInfo": {
+                        "pdf": {"downloadLink": "https://books.google.com/books/download/abc.pdf"},
+                        "webReaderLink": "",
+                        "viewability": "PARTIAL",
+                    },
+                },
+            ],
+        })
+        result = lookup_google_books_pdf_urls(
+            session, "A Fast Method for Power Converter Simulation", timeout=5
+        )
+        self.assertIn("https://books.google.com/books/download/abc.pdf", result)
+
+    def test_empty_title(self):
+        session = _make_session()
+        self.assertEqual(lookup_google_books_pdf_urls(session, "", timeout=5), [])
+
+    def test_non_200(self):
+        session = _make_session(ok=False, status_code=500)
+        self.assertEqual(lookup_google_books_pdf_urls(session, "title", timeout=5), [])
+
+    def test_connection_error(self):
+        session = MagicMock()
+        session.get.side_effect = requests.ConnectionError("fail")
+        self.assertEqual(lookup_google_books_pdf_urls(session, "title", timeout=5), [])
+
+
+# ---------------------------------------------------------------------------
+# lookup_crossref_tdm_urls
+# ---------------------------------------------------------------------------
+
+class TestLookupCrossrefTdm(unittest.TestCase):
+    def test_finds_pdf_from_link_field(self):
+        session = _make_session(json_data={
+            "message": {
+                "items": [
+                    {
+                        "title": ["A Fast Method for Power Converter Simulation"],
+                        "link": [
+                            {"content-type": "application/pdf", "URL": "https://example.org/paper.pdf"},
+                        ],
+                    },
+                ],
+            },
+        })
+        result = lookup_crossref_tdm_urls(session, "A Fast Method for Power Converter Simulation", timeout=5)
+        self.assertIn("https://example.org/paper.pdf", result)
+
+    def test_empty_title(self):
+        session = _make_session()
+        self.assertEqual(lookup_crossref_tdm_urls(session, "", timeout=5), [])
+
+    def test_non_200(self):
+        session = _make_session(ok=False, status_code=503)
+        self.assertEqual(lookup_crossref_tdm_urls(session, "title", timeout=5), [])
+
+    def test_connection_error(self):
+        session = MagicMock()
+        session.get.side_effect = requests.ConnectionError("fail")
+        self.assertEqual(lookup_crossref_tdm_urls(session, "title", timeout=5), [])
+
+
+# ---------------------------------------------------------------------------
+# lookup_ssrn_pdf_urls_by_title
+# ---------------------------------------------------------------------------
+
+class TestLookupSrrn(unittest.TestCase):
+    def test_finds_paper_and_builds_pdf_url(self):
+        session = _make_session(json_data={
+            "papers": [
+                {
+                    "title": "A Fast Method for Power Converter Simulation",
+                    "ssrn_id": "1234567",
+                },
+            ],
+        })
+        result = lookup_ssrn_pdf_urls_by_title(
+            session, "A Fast Method for Power Converter Simulation", timeout=5
+        )
+        self.assertTrue(any("1234567" in u for u in result))
+
+    def test_empty_title(self):
+        session = _make_session()
+        self.assertEqual(lookup_ssrn_pdf_urls_by_title(session, "", timeout=5), [])
+
+    def test_non_200(self):
+        session = _make_session(ok=False, status_code=502)
+        self.assertEqual(lookup_ssrn_pdf_urls_by_title(session, "title", timeout=5), [])
+
+    def test_connection_error(self):
+        session = MagicMock()
+        session.get.side_effect = requests.ConnectionError("fail")
+        self.assertEqual(lookup_ssrn_pdf_urls_by_title(session, "title", timeout=5), [])
+
+
+# ---------------------------------------------------------------------------
+# lookup_chemrxiv_pdf_urls_by_title
+# ---------------------------------------------------------------------------
+
+class TestLookupChemrxiv(unittest.TestCase):
+    def test_finds_pdf_from_files(self):
+        session = _make_session(json_data=[
+            {
+                "title": "A Fast Method for Power Converter Simulation",
+                "files": [
+                    {
+                        "is_link_only": False,
+                        "download_url": "https://figshare.com/ndownloader/files/abc123",
+                    },
+                ],
+            },
+        ])
+        result = lookup_chemrxiv_pdf_urls_by_title(
+            session, "A Fast Method for Power Converter Simulation", timeout=5
+        )
+        self.assertIn("https://figshare.com/ndownloader/files/abc123", result)
+
+    def test_skips_link_only_files(self):
+        session = _make_session(json_data=[
+            {
+                "title": "A Fast Method for Power Converter Simulation",
+                "files": [{"is_link_only": True, "download_url": "https://example.org/gated"}],
+            },
+        ])
+        result = lookup_chemrxiv_pdf_urls_by_title(
+            session, "A Fast Method for Power Converter Simulation", timeout=5
+        )
+        self.assertEqual(result, [])
+
+    def test_empty_title(self):
+        session = _make_session()
+        self.assertEqual(lookup_chemrxiv_pdf_urls_by_title(session, "", timeout=5), [])
+
+    def test_non_200(self):
+        session = _make_session(ok=False, status_code=404)
+        self.assertEqual(lookup_chemrxiv_pdf_urls_by_title(session, "title", timeout=5), [])
+
+
+# ---------------------------------------------------------------------------
+# lookup_researchgate_pdf_urls_by_title
+# ---------------------------------------------------------------------------
+
+class TestLookupResearchgate(unittest.TestCase):
+    def test_finds_pdf_from_html_patterns(self):
+        session = _make_session(
+            text='<a href="/publication/12345678_Method.pdf">PDF</a>'
+        )
+        result = lookup_researchgate_pdf_urls_by_title(
+            session, "A Fast Method for Power Converter Simulation", timeout=5
+        )
+        self.assertTrue(any("researchgate.net" in u for u in result))
+
+    def test_empty_title(self):
+        session = _make_session()
+        self.assertEqual(lookup_researchgate_pdf_urls_by_title(session, "", timeout=5), [])
+
+    def test_non_200(self):
+        session = _make_session(ok=False, status_code=403)
+        self.assertEqual(lookup_researchgate_pdf_urls_by_title(session, "title", timeout=5), [])
+
+    def test_connection_error(self):
+        session = MagicMock()
+        session.get.side_effect = requests.ConnectionError("fail")
+        self.assertEqual(lookup_researchgate_pdf_urls_by_title(session, "title", timeout=5), [])
+
+
+# ---------------------------------------------------------------------------
+# lookup_unpaywall_by_title
+# ---------------------------------------------------------------------------
+
+class TestLookupUnpaywallByTitle(unittest.TestCase):
+    def test_finds_oa_url_through_crossref_then_unpaywall(self):
+        """First call: Crossref search for DOI; Second call: Unpaywall lookup."""
+        crossref_resp = MagicMock()
+        crossref_resp.ok = True
+        crossref_resp.json.return_value = {
+            "message": {
+                "items": [
+                    {
+                        "title": ["A Fast Method for Power Converter Simulation"],
+                        "DOI": "10.1000/abc123",
+                    },
+                ],
+            },
+        }
+        unpaywall_resp = MagicMock()
+        unpaywall_resp.ok = True
+        unpaywall_resp.status_code = 200
+        unpaywall_resp.json.return_value = {
+            "is_oa": True,
+            "best_oa_location": {"url_for_pdf": "https://example.org/oa.pdf"},
+        }
+        session = MagicMock()
+        session.get.side_effect = [crossref_resp, unpaywall_resp]
+        result = lookup_unpaywall_by_title(
+            session, "A Fast Method for Power Converter Simulation", timeout=5
+        )
+        self.assertIn("https://example.org/oa.pdf", result)
+
+    def test_empty_title(self):
+        session = _make_session()
+        self.assertEqual(lookup_unpaywall_by_title(session, "", timeout=5), [])
+
+    def test_non_200(self):
+        session = _make_session(ok=False, status_code=500)
+        self.assertEqual(lookup_unpaywall_by_title(session, "title", timeout=5), [])
+
+
+# ---------------------------------------------------------------------------
+# lookup_openalex_pdf_urls_by_title
+# ---------------------------------------------------------------------------
+
+class TestLookupOpenalex(unittest.TestCase):
+    def test_finds_oa_pdf(self):
+        session = _make_session(json_data={
+            "results": [
+                {
+                    "title": "A Fast Method for Power Converter Simulation",
+                    "open_access": {
+                        "is_oa": True,
+                        "oa_url": "https://example.org/open-access.pdf",
+                    },
+                },
+            ],
+        })
+        result = lookup_openalex_pdf_urls_by_title(
+            session, "A Fast Method for Power Converter Simulation", timeout=5
+        )
+        self.assertIn("https://example.org/open-access.pdf", result)
+
+    def test_finds_pdf_from_locations(self):
+        session = _make_session(json_data={
+            "results": [
+                {
+                    "title": "A Fast Method for Power Converter Simulation",
+                    "open_access": {"is_oa": False},
+                    "locations": [
+                        {"pdf_url": "https://repo.example.org/paper.pdf"},
+                    ],
+                },
+            ],
+        })
+        result = lookup_openalex_pdf_urls_by_title(
+            session, "A Fast Method for Power Converter Simulation", timeout=5
+        )
+        self.assertIn("https://repo.example.org/paper.pdf", result)
+
+    def test_empty_title(self):
+        session = _make_session()
+        self.assertEqual(lookup_openalex_pdf_urls_by_title(session, "", timeout=5), [])
+
+    def test_non_200(self):
+        session = _make_session(ok=False, status_code=429)
+        self.assertEqual(lookup_openalex_pdf_urls_by_title(session, "title", timeout=5), [])
+
+    def test_connection_error(self):
+        session = MagicMock()
+        session.get.side_effect = requests.ConnectionError("fail")
+        self.assertEqual(lookup_openalex_pdf_urls_by_title(session, "title", timeout=5), [])
 
 
 if __name__ == "__main__":
