@@ -520,6 +520,7 @@ def lookup_arxiv_pdf_urls_by_title(
     session: requests.Session,
     expected_title: str,
     timeout: int,
+    max_results: int = 5,
 ) -> list[str]:
     title = (expected_title or "").strip().strip(" \t\r\n,.;:，。；：")
     if not title:
