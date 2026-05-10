@@ -9,7 +9,6 @@ from src.lookup import (
     lookup_biorxiv_pdf_urls_by_title,
     lookup_semanticscholar_pdf_urls_by_title,
     lookup_europepmc_pdf_urls_by_title,
-    lookup_crossref_by_bibliographic,
     lookup_unpaywall,
     lookup_core_pdf_urls_by_title,
     lookup_secondary_ranked,
@@ -240,49 +239,6 @@ class TestLookupEuropePmc(unittest.TestCase):
     def test_non_200(self):
         session = _make_session(ok=False, status_code=502)
         self.assertEqual(lookup_europepmc_pdf_urls_by_title(session, "title", timeout=5), [])
-
-
-# ---------------------------------------------------------------------------
-# lookup_crossref_by_bibliographic
-# ---------------------------------------------------------------------------
-
-class TestLookupCrossref(unittest.TestCase):
-    def test_returns_dois_and_urls(self):
-        item = ReferenceItem(
-            number=1,
-            text="Smith J. A fast method for power converter simulation. IEEE Trans. 2023",
-            dois=[], urls=[],
-        )
-        session = _make_session(json_data={
-            "message": {
-                "items": [
-                    {
-                        "DOI": "10.1000/abc123",
-                        "URL": "https://doi.org/10.1000/abc123",
-                        "link": [{"URL": "https://ieeexplore.ieee.org/document/123"}],
-                    },
-                ],
-            },
-        })
-        dois, urls = lookup_crossref_by_bibliographic(session, item, timeout=5)
-        self.assertIn("10.1000/abc123", dois)
-        self.assertTrue(any("ieeexplore.ieee.org" in u for u in urls))
-        session.get.assert_called_once()
-        self.assertIn("api.crossref.org", session.get.call_args[0][0])
-
-    def test_non_200_returns_empty(self):
-        item = ReferenceItem(number=1, text="text", dois=[], urls=[])
-        session = _make_session(ok=False, status_code=404)
-        dois, urls = lookup_crossref_by_bibliographic(session, item, timeout=5)
-        self.assertEqual(dois, [])
-        self.assertEqual(urls, [])
-
-    def test_connection_error_returns_empty(self):
-        item = ReferenceItem(number=1, text="text", dois=[], urls=[])
-        session = MagicMock()
-        session.get.side_effect = requests.ConnectionError("fail")
-        dois, urls = lookup_crossref_by_bibliographic(session, item, timeout=5)
-        self.assertEqual(dois, [])
 
 
 # ---------------------------------------------------------------------------

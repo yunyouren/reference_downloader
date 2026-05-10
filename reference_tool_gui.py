@@ -22,7 +22,7 @@ from tkinter.scrolledtext import ScrolledText
 from core.verify import verify_and_rename_pdf
 from src.lookup import guess_title_query, parse_first_author_surname, parse_ref_year
 from src.downloader import load_config_file, run_pipeline
-from src.models import ReferenceItem
+from src.models import ReferenceItem, PipelineConfig
 
 STATUS_ORDER = ["downloaded_pdf", "saved_landing_url", "failed", "not_attempted"]
 
@@ -1127,33 +1127,35 @@ class ReferenceToolGUI:
         )
         self._pipeline_thread.start()
 
-    def _pipeline_runner(self, cfg: dict[str, Any]) -> None:
+    def _pipeline_runner(self, gui_cfg: dict[str, Any]) -> None:
         try:
+            cookies = gui_cfg.get("cookies")
+            cfg = PipelineConfig(
+                input_pdf=Path(gui_cfg["input"]),
+                output_dir=Path(gui_cfg["output"]),
+                pdf_parser=str(gui_cfg.get("pdf_parser", "pdfplumber")),
+                cookies_path=Path(cookies) if cookies else None,
+                timeout=int(gui_cfg.get("timeout", 20)),
+                lookup_timeout=int(gui_cfg.get("lookup_timeout", 6)),
+                retries=int(gui_cfg.get("retries", 1)),
+                workers=int(gui_cfg.get("workers", 8)),
+                max_candidates_per_item=int(gui_cfg.get("max_candidates_per_item", 3)),
+                secondary_lookup=bool(gui_cfg.get("secondary_lookup", False)),
+                secondary_max=int(gui_cfg.get("secondary_max", 40)),
+                secondary_top_k=int(gui_cfg.get("secondary_top_k", 2)),
+                unpaywall_email=str(gui_cfg.get("unpaywall_email", "")),
+                verify_title_rename=bool(gui_cfg.get("verify_title_rename", False)),
+                verify_rename_mode=str(gui_cfg.get("verify_rename_mode", "number_and_original")),
+                verify_title_threshold=float(gui_cfg.get("verify_title_threshold", 0.55)),
+                domain_cookies_file=str(gui_cfg.get("domain_cookies_file", "domain_cookies.json")),
+                generic_download_sites=gui_cfg.get("generic_download_sites", []),
+                interactive="false",
+                neurips_proceedings=str(gui_cfg.get("neurips_proceedings", "true")).lower() == "true",
+                show_progress=False,
+            )
             f = io.StringIO()
             with contextlib.redirect_stdout(f):
-                run_pipeline(
-                    input_pdf=Path(cfg["input"]),
-                    output_dir=Path(cfg["output"]),
-                    pdf_parser=str(cfg.get("pdf_parser", "pdfplumber")),
-                    cookies_path=Path(cfg["cookies"]) if cfg.get("cookies") else None,
-                    timeout=int(cfg.get("timeout", 20)),
-                    lookup_timeout=int(cfg.get("lookup_timeout", 6)),
-                    retries=int(cfg.get("retries", 1)),
-                    workers=int(cfg.get("workers", 8)),
-                    max_candidates_per_item=int(cfg.get("max_candidates_per_item", 3)),
-                    secondary_lookup=bool(cfg.get("secondary_lookup", False)),
-                    secondary_max=int(cfg.get("secondary_max", 40)),
-                    secondary_top_k=int(cfg.get("secondary_top_k", 2)),
-                    unpaywall_email=str(cfg.get("unpaywall_email", "")),
-                    verify_title_rename=bool(cfg.get("verify_title_rename", False)),
-                    verify_rename_mode=str(cfg.get("verify_rename_mode", "number_and_original")),
-                    verify_title_threshold=float(cfg.get("verify_title_threshold", 0.55)),
-                    domain_cookies_file=str(cfg.get("domain_cookies_file", "domain_cookies.json")),
-                    generic_download_sites=cfg.get("generic_download_sites", []),
-                    interactive="false",
-                    neurips_proceedings=str(cfg.get("neurips_proceedings", "true")).lower() == "true",
-                    show_progress=False,
-                )
+                run_pipeline(cfg)
             output = f.getvalue()
             for line in output.splitlines(keepends=True):
                 self.log_queue.put(line)

@@ -192,3 +192,64 @@ class DomainLimiter:
         if sem is None:
             return
         sem.release()
+
+
+@dataclass
+class PipelineConfig:
+    """Configuration for the full reference extraction + download pipeline."""
+
+    input_pdf: Path
+    output_dir: Path = field(default_factory=lambda: Path("references_output"))
+
+    # PDF parsing
+    pdf_parser: str = "pdfplumber"
+    header_margin: float = 40.0
+    footer_margin: float = 40.0
+
+    # HTTP / network
+    timeout: int = 20
+    lookup_timeout: int = 6
+    retries: int = 1
+    user_agent: str = "ReferenceDownloader/1.1"
+    cookies_path: Path | None = None
+
+    # Concurrency
+    workers: int = 8
+    max_per_domain: int = 2
+    min_domain_delay_ms: int = 0
+    api_concurrency: int = 1
+    api_min_delay_ms: int = 500
+
+    # Download behavior
+    download_log: str = "download_log.csv"
+    unpaywall_email: str = ""
+    max_candidates_per_item: int = 3
+    skip_doi: bool = False
+    download_max: int = 0
+    no_download: bool = False
+    resume: bool = True
+    show_progress: bool = True
+
+    # Secondary lookup
+    secondary_lookup: bool = False
+    secondary_max: int = 40
+    secondary_top_k: int = 2
+    secondary_cache: str = ""
+    neurips_proceedings: bool = True
+
+    # Verification
+    verify_title_rename: bool = False
+    verify_rename_mode: str = "number_and_original"
+    verify_title_threshold: float = 0.55
+
+    # Directories
+    verified_subdir: str = "verified_pdfs"
+    meta_subdir: str = "meta"
+    landing_subdir: str = "landing_urls"
+    mismatch_subdir: str = "mismatch_pdfs"
+
+    # Site / domain
+    generic_download_sites: list[str] = field(default_factory=list)
+    domain_cookies_file: str = "domain_cookies.json"
+    domain_cookies_config: dict[str, dict] | None = None
+    interactive: str = "auto"

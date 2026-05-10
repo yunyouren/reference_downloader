@@ -30,6 +30,7 @@ import sys
 from pathlib import Path
 
 from core.verify import VerifyWeights
+from src.models import PipelineConfig
 from src.downloader import load_config_file, run_pipeline
 
 
@@ -162,18 +163,9 @@ def main() -> None:
     if not args.input:
         parser.error("--input is required (or set 'input' in --config JSON)")
 
-    verify_weights = VerifyWeights(
-        title_weight=float(getattr(args, "verify_title_weight", 1.0)),
-        line_weight=float(getattr(args, "verify_line_weight", 1.0)),
-        year_hit_bonus=float(getattr(args, "verify_year_hit_bonus", 0.0)),
-        year_miss_multiplier=float(getattr(args, "verify_year_miss_mult", 0.95)),
-        author_hit_bonus=float(getattr(args, "verify_author_hit_bonus", 0.0)),
-        author_miss_multiplier=float(getattr(args, "verify_author_miss_mult", 0.97)),
-    )
-
     cookies_path = Path(args.cookies) if args.cookies and Path(args.cookies).exists() else None
 
-    run_pipeline(
+    cfg = PipelineConfig(
         input_pdf=Path(args.input),
         output_dir=Path(args.output),
         pdf_parser=args.pdf_parser,
@@ -186,7 +178,6 @@ def main() -> None:
         verify_title_rename=bool(args.verify_title_rename),
         verify_rename_mode=str(getattr(args, "verify_rename_mode", "number_and_original")),
         verify_title_threshold=float(args.verify_title_threshold),
-        verify_weights=verify_weights,
         verified_subdir=str(getattr(args, "verified_subdir", "verified_pdfs")),
         meta_subdir=str(getattr(args, "meta_subdir", "meta")),
         landing_subdir=str(getattr(args, "landing_subdir", "landing_urls")),
@@ -214,6 +205,17 @@ def main() -> None:
         api_min_delay_ms=int(getattr(args, "api_min_delay_ms", 500)),
         neurips_proceedings=str(getattr(args, "neurips_proceedings", "true")).lower() == "true",
     )
+
+    verify_weights = VerifyWeights(
+        title_weight=float(getattr(args, "verify_title_weight", 1.0)),
+        line_weight=float(getattr(args, "verify_line_weight", 1.0)),
+        year_hit_bonus=float(getattr(args, "verify_year_hit_bonus", 0.0)),
+        year_miss_multiplier=float(getattr(args, "verify_year_miss_mult", 0.95)),
+        author_hit_bonus=float(getattr(args, "verify_author_hit_bonus", 0.0)),
+        author_miss_multiplier=float(getattr(args, "verify_author_miss_mult", 0.97)),
+    )
+
+    run_pipeline(cfg, verify_weights=verify_weights)
 
 
 if __name__ == "__main__":
