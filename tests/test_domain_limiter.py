@@ -1,6 +1,6 @@
 import unittest
 
-from reference_tool import DomainLimiter
+from src.models import DomainLimiter
 
 
 class TestDomainLimiter(unittest.TestCase):

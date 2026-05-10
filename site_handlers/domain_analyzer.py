@@ -8,7 +8,7 @@ from collections import defaultdict
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from reference_tool import ReferenceItem
+    from src.models import ReferenceItem
 
 
 @dataclass

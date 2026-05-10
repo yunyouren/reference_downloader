@@ -19,14 +19,9 @@ from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from core.verify import verify_and_rename_pdf
-from reference_tool import (
-    guess_title_query,
-    load_config_file,
-    parse_first_author_surname,
-    parse_ref_year,
-    suggest_cookies_configuration,
-    ReferenceItem,
-)
+from src.lookup import guess_title_query, parse_first_author_surname, parse_ref_year
+from src.downloader import load_config_file, suggest_cookies_configuration
+from src.models import ReferenceItem
 
 STATUS_ORDER = ["downloaded_pdf", "saved_landing_url", "failed", "not_attempted"]
 
