@@ -163,6 +163,10 @@ def is_reference_start_line(line: str) -> bool:
     # Another common pattern: "Author et al., 2021, ..."
     if re.match(r"^[A-Z].+et al\.,\s*(?:19|20)\d{2}", line):
         return True
+    # Chinese author pattern: starts with CJK chars + Chinese/comma
+    # e.g., "张三，李四." or "欧阳修, 王五."
+    if re.match(r"^[一-鿿]{1,6}[，,]\s*", line):
+        return True
     return False
 
 

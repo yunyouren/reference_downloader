@@ -60,40 +60,79 @@ def build_verified_pdf_name(*, prefix: str, original_name: str, rename_mode: Ren
     return f"{prefix} {clean}.pdf" if clean else f"{prefix}.pdf"
 
 
+# ── CJK title matching support ────────────────────────────────────────────
+
+_CJK_RANGE = r"一-鿿㐀-䶿"
+
+# Single CJK characters that carry little semantic weight in titles
+_CJK_STOP_CHARS = set(
+    "的了吗我你是他有在也都会这不让与及或其之到可以中对和而但被从把所因为自就个以能下去里过后说些那还又如它才用"
+    "日年月至大小高低温正负重新旧前后内外部件器等体量测检实分制控保护处存运输按选择开关连"
+)
+
+# Common CJK academic bigrams that function like English stop words
+_CJK_STOP_BIGRAMS = {
+    "基于", "用于", "一种", "方法", "研究", "及其", "本文", "提出", "进行", "通过",
+    "利用", "实现", "采用", "分析", "设计", "结果", "表明", "验证", "仿真", "实验",
+    "系统", "模型", "问题", "应用", "影响", "不同", "之间", "具有", "考虑", "针对",
+    "比较", "主要", "能够", "可以", "其中", "所示", "如图", "上述", "以下", "相关",
+    "改进", "优化", "性能", "特性", "控制", "建模", "估计", "预测", "监测", "检测",
+}
+
+
 def normalize_title_tokens(text: str) -> list[str]:
+    """Tokenize a title for Jaccard matching, preserving CJK characters.
+
+    ASCII words shorter than 3 characters are dropped (unchanged from the
+    original behaviour).  CJK titles are decomposed into character bigrams
+    so that ``title_match_score`` works for Chinese-only, English-only, and
+    mixed-language titles.
+    """
     raw = (text or "").lower()
-    raw = re.sub(r"[\u2010-\u2015\u2212]", "-", raw)
-    raw = re.sub(r"[^a-z0-9]+", " ", raw)
-    tokens = [t for t in raw.split() if len(t) >= 3]
+    raw = re.sub(r"[‐-―−]", "-", raw)
+    raw = re.sub(rf"[^a-z0-9{_CJK_RANGE}]+", " ", raw)
+
+    tokens: list[str] = []
+    for t in raw.split():
+        if re.match(r"^[a-z0-9]+$", t):
+            if len(t) >= 3:
+                tokens.append(t)
+        else:
+            tokens.append(t)
+
     stop = {
-        "the",
-        "and",
-        "for",
-        "with",
-        "from",
-        "into",
-        "over",
-        "under",
-        "between",
-        "within",
-        "using",
-        "use",
-        "via",
-        "based",
-        "model",
-        "models",
-        "analysis",
-        "study",
-        "method",
-        "methods",
-        "approach",
-        "approaches",
-        "system",
-        "systems",
-        "paper",
-        "review",
+        "the", "and", "for", "with", "from", "into", "over", "under",
+        "between", "within", "using", "use", "via", "based",
+        "model", "models", "analysis", "study", "method", "methods",
+        "approach", "approaches", "system", "systems", "paper", "review",
     }
-    return [t for t in tokens if t not in stop]
+    tokens = [t for t in tokens if t not in stop]
+
+    cjk_tokens: list[str] = []
+    ascii_tokens: list[str] = []
+    for t in tokens:
+        cjk_part = "".join(re.findall(rf"[{_CJK_RANGE}]+", t))
+        ascii_part = "".join(re.findall(r"[a-z0-9]+", t))
+        if cjk_part:
+            cjk_tokens.append(cjk_part)
+        if ascii_part and len(ascii_part) >= 3:
+            ascii_tokens.append(ascii_part)
+
+    if not cjk_tokens:
+        return ascii_tokens
+
+    result: list[str] = list(ascii_tokens)
+    joined = "".join(cjk_tokens)
+    chars = list(joined)
+    for i in range(len(chars) - 1):
+        a, b = chars[i], chars[i + 1]
+        bigram = a + b
+        if bigram in _CJK_STOP_BIGRAMS:
+            continue
+        if a in _CJK_STOP_CHARS and b in _CJK_STOP_CHARS:
+            continue
+        result.append(bigram)
+    return result
 
 
 def title_match_score(pdf_title: str, expected_title: str) -> float:

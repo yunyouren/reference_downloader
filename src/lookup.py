@@ -43,8 +43,42 @@ def guess_title_query(ref_text: str) -> str:
     parts = [p.strip() for p in re.split(r"[.;。；]", tmp) if p.strip()]
     if not parts:
         return ref_text[:120]
-    best = max(parts, key=len)
+
+    # Strip GB/T 7714 type markers: [J], [D], [M], [C], [N], [R], [P], [S], [Z], [A], [G]
+    _GB_MARKER_RE = re.compile(r"\s*\[[JDMCNRPSZAG]\][\s，,]*")
+    # Strip leading numeric marker like "[1]" from each segment
+    _NUM_MARKER_RE = re.compile(r"^\[\d+\][\s,，]*")
+    # Patterns that indicate non-title content
+    _JOURNAL_META_RE = re.compile(
+        r"\b(?:vol|no|pp|ed|dept|univ|university|issue|pages?|issn|isbn|doi)\b",
+        flags=re.IGNORECASE,
+    )
+
+    scored: list[tuple[float, str]] = []
+    for part in parts:
+        cleaned = _GB_MARKER_RE.sub("", _NUM_MARKER_RE.sub("", part)).strip()
+        if len(cleaned) < 6:
+            continue
+        # Penalise segments heavy on journal metadata
+        score = float(len(cleaned))
+        if _JOURNAL_META_RE.search(cleaned):
+            score *= 0.3
+        # Heavily penalise segments that are mostly digits/punctuation
+        alpha_ratio = sum(1 for c in cleaned if c.isalpha() or "一" <= c <= "鿿") / max(len(cleaned), 1)
+        if alpha_ratio < 0.3:
+            score *= 0.2
+        # Prefer segments with more CJK or alpha content
+        score += alpha_ratio * 20
+        scored.append((score, cleaned))
+
+    if not scored:
+        cleaned = _GB_MARKER_RE.sub("", _NUM_MARKER_RE.sub("", parts[0])).strip()
+        return cleaned[:180]
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best = scored[0][1]
     best = re.sub(r"\b(?:vol|no|pp|ed|dept|univ|university)\b.*$", "", best, flags=re.IGNORECASE)
+    best = _GB_MARKER_RE.sub("", best).strip()
     return best[:180].strip()
 
 
@@ -62,6 +96,12 @@ def parse_first_author_surname(ref_text: str) -> str:
     txt = (ref_text or "").strip()
     if not txt:
         return ""
+    # Chinese author: strip leading [N] marker then take first 1-3 CJK chars
+    # e.g., "[1] 张三，李四. ..." → "张", "欧阳修，..." → "欧阳"
+    txt_no_num = re.sub(r"^\[\d+\]\s*", "", txt)
+    cjk_m = re.match(r"^([一-鿿]{1,3})", txt_no_num)
+    if cjk_m:
+        return cjk_m.group(1)
     m = re.match(r"^\s*([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'`\\-]{1,40})\b", txt)
     if m:
         return m.group(1).lower()
@@ -72,46 +112,9 @@ def parse_first_author_surname(ref_text: str) -> str:
 
 
 def secondary_title_score(candidate_title: str, expected_title: str) -> float:
-    def tokens(text: str) -> set[str]:
-        raw = (text or "").lower()
-        raw = re.sub(r"[‐-―−]", "-", raw)
-        raw = re.sub(r"[^a-z0-9]+", " ", raw)
-        toks = [t for t in raw.split() if len(t) >= 3]
-        stop = {
-            "the",
-            "and",
-            "for",
-            "with",
-            "from",
-            "into",
-            "over",
-            "under",
-            "between",
-            "within",
-            "using",
-            "use",
-            "via",
-            "based",
-            "model",
-            "models",
-            "analysis",
-            "study",
-            "method",
-            "methods",
-            "approach",
-            "approaches",
-            "system",
-            "systems",
-            "paper",
-            "review",
-        }
-        return {t for t in toks if t not in stop}
+    from core.verify import title_match_score
 
-    a = tokens(candidate_title)
-    b = tokens(expected_title)
-    if not a or not b:
-        return 0.0
-    return float(len(a & b)) / float(len(a | b))
+    return title_match_score(candidate_title, expected_title)
 
 
 def unique_preserve_order(values: Iterable[str]) -> list[str]:
@@ -141,7 +144,9 @@ def lookup_secondary_ranked(
     expected = guess_title_query(item.text)
     ref_year = parse_ref_year(item.text)
     surname = parse_first_author_surname(item.text)
-    author_query = surname if len(surname) >= 3 else ""
+    # CJK surnames can be 1-2 chars (e.g. 张, 欧阳); Latin surnames need >=3
+    is_cjk_surname = bool(surname and re.search(r"[一-鿿]", surname))
+    author_query = surname if (is_cjk_surname and len(surname) >= 1) or len(surname) >= 3 else ""
     candidates: list[SecondaryLookupCandidate] = []
     min_keep_score = 0.12
 
@@ -278,6 +283,25 @@ def lookup_secondary_ranked(
                             urls=urls,
                         )
                     )
+    except Exception:
+        pass
+
+    # Baidu Scholar — Chinese literature source
+    try:
+        bd_urls = lookup_baidu_xueshu_pdf_urls_by_title(session, expected, timeout=timeout)
+        if bd_urls:
+            for url in bd_urls:
+                doi = ""
+                if "doi.org/" in url:
+                    doi = url.split("doi.org/", 1)[1]
+                urls = sorted(unique_preserve_order([url]), key=url_priority)
+                candidates.append(
+                    SecondaryLookupCandidate(
+                        score=0.50,
+                        doi=doi,
+                        urls=urls,
+                    )
+                )
     except Exception:
         pass
 
@@ -781,6 +805,65 @@ def lookup_chemrxiv_pdf_urls_by_title(
                     if pdf_url:
                         out.append((score, pdf_url))
                         break
+
+        out.sort(key=lambda x: x[0], reverse=True)
+        return unique_preserve_order([u for _, u in out])
+    except Exception:
+        return []
+
+
+def lookup_baidu_xueshu_pdf_urls_by_title(
+    session: requests.Session,
+    expected_title: str,
+    timeout: int,
+) -> list[str]:
+    """通过标题搜索百度学术，提取 DOI 和源链接。
+
+    百度学术是中国最大的学术搜索引擎，覆盖知网、万方、维普等中文数据库。
+    此函数搜索后提取 DOI（可复用现有 Unpaywall/Crossref 链路）和 CNKI 源链接。
+    """
+    title = (expected_title or "").strip().strip(" \t\r\n,.;:，。；：")
+    if not title:
+        return []
+    try:
+        res = session.get(
+            "https://xueshu.baidu.com/s",
+            params={"wd": title[:200]},
+            timeout=timeout,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "text/html,application/xhtml+xml",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            },
+        )
+        if not res.ok:
+            return []
+        html = res.text
+
+        out: list[tuple[float, str]] = []
+
+        # Extract DOIs from the page
+        doi_matches = re.findall(r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)", html)
+        for doi in doi_matches:
+            doi_clean = doi.rstrip(".,;)")
+            if len(doi_clean) > 15:
+                out.append((0.8, f"https://doi.org/{doi_clean}"))
+
+        # Extract CNKI links (kns.cnki.net)
+        cnki_matches = re.findall(
+            r'href=["\']?(https?://(?:kns\.cnki\.net|www\.cnki\.com\.cn)/[^"\'\s]+)["\']?',
+            html,
+        )
+        for link in cnki_matches[:3]:
+            out.append((0.6, link))
+
+        # Extract Wanfang links
+        wf_matches = re.findall(
+            r'href=["\']?(https?://(?:d\.wanfangdata\.com\.cn|www\.wanfangdata\.com\.cn)/[^"\'\s]+)["\']?',
+            html,
+        )
+        for link in wf_matches[:3]:
+            out.append((0.5, link))
 
         out.sort(key=lambda x: x[0], reverse=True)
         return unique_preserve_order([u for _, u in out])
