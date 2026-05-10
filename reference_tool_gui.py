@@ -3,13 +3,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import importlib.util
 import os
 import queue
 import subprocess
 import sys
-import tempfile
 import threading
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,7 @@ from tkinter.scrolledtext import ScrolledText
 
 from core.verify import verify_and_rename_pdf
 from src.lookup import guess_title_query, parse_first_author_surname, parse_ref_year
-from src.downloader import load_config_file, suggest_cookies_configuration
+from src.downloader import load_config_file, run_pipeline
 from src.models import ReferenceItem
 
 STATUS_ORDER = ["downloaded_pdf", "saved_landing_url", "failed", "not_attempted"]
@@ -501,10 +502,9 @@ class ReferenceToolGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.base_dir = Path(__file__).resolve().parent
-        self.script_path = self.base_dir / "reference_tool.py"
-        self.proc: subprocess.Popen[str] | None = None
+        self._pipeline_thread: threading.Thread | None = None
+        self._stop_requested = threading.Event()
         self.log_queue: queue.Queue[str] = queue.Queue()
-        self.temp_config_path: Path | None = None
 
         self.lang_var = tk.StringVar(value="zh")
         self.input_var = tk.StringVar(value="")
@@ -1100,7 +1100,7 @@ class ReferenceToolGUI:
         self._apply_recommended_defaults(notify_if_fallback=True, mode="speed")
 
     def _run(self) -> None:
-        if self.proc is not None and self.proc.poll() is None:
+        if self._pipeline_thread is not None and self._pipeline_thread.is_alive():
             return
         try:
             cfg = self._collect_config()
@@ -1115,30 +1115,53 @@ class ReferenceToolGUI:
                 "pdfplumber is not installed. Switched parser to pypdf. "
                 "Install with: pip install pdfplumber",
             )
-        if not self.script_path.exists():
-            messagebox.showerror(self._tr("invalid"), f"missing: {self.script_path}")
-            return
         Path(cfg["output"]).mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".json", delete=False, dir=self.base_dir) as tmp:
-            json.dump(cfg, tmp, ensure_ascii=False, indent=2)
-            self.temp_config_path = Path(tmp.name)
-        cmd = [sys.executable, str(self.script_path), "--config", str(self.temp_config_path)]
-        self._append_log("$ " + " ".join(cmd) + "\n")
-        self.proc = subprocess.Popen(
-            cmd,
-            cwd=self.base_dir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
+        self._append_log("$ run_pipeline()\n")
         self.run_btn.state(["disabled"])
         self.stop_btn.state(["!disabled"])
         self.progress.start(10)
         self._set_status("running")
-        threading.Thread(target=self._reader_thread, daemon=True).start()
+        self._stop_requested.clear()
+        self._pipeline_thread = threading.Thread(
+            target=self._pipeline_runner, args=(cfg,), daemon=True
+        )
+        self._pipeline_thread.start()
+
+    def _pipeline_runner(self, cfg: dict[str, Any]) -> None:
+        try:
+            f = io.StringIO()
+            with contextlib.redirect_stdout(f):
+                run_pipeline(
+                    input_pdf=Path(cfg["input"]),
+                    output_dir=Path(cfg["output"]),
+                    pdf_parser=str(cfg.get("pdf_parser", "pdfplumber")),
+                    cookies_path=Path(cfg["cookies"]) if cfg.get("cookies") else None,
+                    timeout=int(cfg.get("timeout", 20)),
+                    lookup_timeout=int(cfg.get("lookup_timeout", 6)),
+                    retries=int(cfg.get("retries", 1)),
+                    workers=int(cfg.get("workers", 8)),
+                    max_candidates_per_item=int(cfg.get("max_candidates_per_item", 3)),
+                    secondary_lookup=bool(cfg.get("secondary_lookup", False)),
+                    secondary_max=int(cfg.get("secondary_max", 40)),
+                    secondary_top_k=int(cfg.get("secondary_top_k", 2)),
+                    unpaywall_email=str(cfg.get("unpaywall_email", "")),
+                    verify_title_rename=bool(cfg.get("verify_title_rename", False)),
+                    verify_rename_mode=str(cfg.get("verify_rename_mode", "number_and_original")),
+                    verify_title_threshold=float(cfg.get("verify_title_threshold", 0.55)),
+                    domain_cookies_file=str(cfg.get("domain_cookies_file", "domain_cookies.json")),
+                    generic_download_sites=cfg.get("generic_download_sites", []),
+                    interactive="false",
+                    neurips_proceedings=str(cfg.get("neurips_proceedings", "true")).lower() == "true",
+                    show_progress=False,
+                )
+            output = f.getvalue()
+            for line in output.splitlines(keepends=True):
+                self.log_queue.put(line)
+        except Exception as exc:
+            self.log_queue.put(f"Error: {exc}\n")
+            self.log_queue.put("__EXIT__:1")
+        else:
+            self.log_queue.put("__EXIT__:0")
 
     def _rename_only(self) -> None:
         try:
@@ -1159,20 +1182,10 @@ class ReferenceToolGUI:
         except Exception as exc:
             messagebox.showerror(self._tr("invalid"), str(exc))
 
-    def _reader_thread(self) -> None:
-        assert self.proc is not None
-        if self.proc.stdout is not None:
-            for line in self.proc.stdout:
-                self.log_queue.put(line)
-        self.log_queue.put(f"__EXIT__:{self.proc.wait()}")
-
     def _stop(self) -> None:
-        if self.proc is None or self.proc.poll() is not None:
+        if self._pipeline_thread is None or not self._pipeline_thread.is_alive():
             return
-        try:
-            self.proc.terminate()
-        except Exception:
-            pass
+        self._stop_requested.set()
 
     def _append_log(self, text: str) -> None:
         self.log_text.configure(state=tk.NORMAL)
@@ -1196,14 +1209,8 @@ class ReferenceToolGUI:
         self.progress.stop()
         self.run_btn.state(["!disabled"])
         self.stop_btn.state(["disabled"])
-        self.proc = None
+        self._pipeline_thread = None
         self._set_status("finished" if code == 0 else "stopped")
-        if self.temp_config_path and self.temp_config_path.exists():
-            try:
-                self.temp_config_path.unlink()
-            except Exception:
-                pass
-        self.temp_config_path = None
         self._refresh_summary()
 
     def _save_config(self) -> None:
@@ -1401,7 +1408,7 @@ class ReferenceToolGUI:
         ttk.Button(btns, text=self._tr("cancel_btn"), command=dialog.destroy).pack(side=tk.RIGHT)
 
     def _on_close(self) -> None:
-        if self.proc is not None and self.proc.poll() is None:
+        if self._pipeline_thread is not None and self._pipeline_thread.is_alive():
             self._stop()
         self.root.destroy()
 

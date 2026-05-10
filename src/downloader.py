@@ -50,8 +50,10 @@ from src.models import (
     ReferenceItem, DownloadAttempt, DownloadLogger,
     SecondaryLookupCache, DomainLimiter,
 )
-from src.candidates import iter_candidate_urls_with_generic_sites
+from src.candidates import iter_candidate_urls_with_generic_sites, normalize_generic_download_sites
 from src.lookup import lookup_secondary_ranked, guess_title_query
+from src.parsers import read_pdf_text, extract_references_section, split_references
+from src.output import write_outputs
 
 try:
     from tqdm import tqdm  # type: ignore[import-untyped]
@@ -1591,3 +1593,208 @@ def load_domain_cookies(
             except Exception:
                 pass
     return result
+
+
+def run_pipeline(
+    input_pdf: Path,
+    output_dir: Path,
+    *,
+    pdf_parser: str = "pdfplumber",
+    header_margin: float = 40.0,
+    footer_margin: float = 40.0,
+    timeout: int = 20,
+    lookup_timeout: int = 6,
+    retries: int = 1,
+    cookies_path: Path | None = None,
+    verify_title_rename: bool = False,
+    verify_rename_mode: str = "number_and_original",
+    verify_title_threshold: float = 0.55,
+    verify_weights: VerifyWeights | None = None,
+    verified_subdir: str = "verified_pdfs",
+    meta_subdir: str = "meta",
+    landing_subdir: str = "landing_urls",
+    mismatch_subdir: str = "mismatch_pdfs",
+    workers: int = 8,
+    max_per_domain: int = 2,
+    min_domain_delay_ms: int = 0,
+    user_agent: str = "ReferenceDownloader/1.1",
+    download_log: str = "download_log.csv",
+    unpaywall_email: str = "",
+    max_candidates_per_item: int = 3,
+    skip_doi: bool = False,
+    download_max: int = 0,
+    secondary_lookup: bool = False,
+    secondary_max: int = 40,
+    secondary_top_k: int = 2,
+    secondary_cache: str = "",
+    generic_download_sites: list[str] | None = None,
+    domain_cookies_file: str = "domain_cookies.json",
+    domain_cookies_config: dict[str, dict] | None = None,
+    no_download: bool = False,
+    resume: bool = True,
+    show_progress: bool = True,
+    interactive: str = "auto",
+    api_concurrency: int = 1,
+    api_min_delay_ms: int = 500,
+    neurips_proceedings: bool = True,
+) -> list[ReferenceItem]:
+    """Run the full reference extraction and download pipeline.
+
+    Returns the list of reference items with download status populated.
+    """
+    from site_handlers.domain_analyzer import analyze_reference_domains
+    from src.interactive_ui import should_run_interactive, display_domain_summary, configure_cookies_interactively
+
+    if verify_weights is None:
+        verify_weights = VerifyWeights()
+
+    # Load cookies
+    cookies_jar: MozillaCookieJar | None = None
+    if cookies_path and cookies_path.exists():
+        cookies_jar = load_cookies_txt(cookies_path)
+
+    # Resolve directories
+    downloads_dir = output_dir / "downloads"
+    meta_dir = resolve_downloads_subdir(downloads_dir, meta_subdir)
+    landing_dir = resolve_downloads_subdir(downloads_dir, landing_subdir)
+    mismatch_dir = resolve_downloads_subdir(downloads_dir, mismatch_subdir)
+    verified_dir: Path | None = None
+    if verify_title_rename:
+        verified_dir = resolve_downloads_subdir(downloads_dir, verified_subdir)
+
+    # Validate input
+    if not input_pdf.exists():
+        raise FileNotFoundError(f"Input PDF does not exist: {input_pdf}")
+    if not input_pdf.is_file():
+        raise ValueError(f"Input PDF is not a file: {input_pdf}")
+    if input_pdf.stat().st_size <= 0:
+        raise ValueError(f"Input PDF is empty: {input_pdf}")
+
+    # 1) Read PDF text
+    try:
+        full_text = read_pdf_text(
+            input_pdf,
+            parser=pdf_parser,
+            header_margin=header_margin,
+            footer_margin=footer_margin,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read input PDF: {input_pdf} ({exc})") from exc
+
+    # 2) Extract references section and split into items
+    ref_section = extract_references_section(full_text)
+    refs = split_references(ref_section)
+
+    # 3) Domain analysis and interactive configuration
+    domain_cookies_file_path = Path(domain_cookies_file)
+    if not domain_cookies_file_path.is_absolute():
+        domain_cookies_file_path = output_dir / domain_cookies_file_path
+    if domain_cookies_config is None:
+        domain_cookies_config = load_domain_cookies_config(domain_cookies_file_path)
+
+    domain_info = analyze_reference_domains(refs, domain_cookies_config)
+    display_domain_summary(domain_info)
+
+    is_interactive = should_run_interactive(interactive)
+    if is_interactive:
+        new_config = configure_cookies_interactively(domain_info, domain_cookies_config)
+        if new_config != domain_cookies_config:
+            domain_cookies_config = new_config
+            save_domain_cookies_config(domain_cookies_config, domain_cookies_file_path)
+            print(f"\n已保存域名cookies配置到: {domain_cookies_file_path}")
+
+    domain_cookies = load_domain_cookies(domain_cookies_config, Path.cwd())
+    sites = normalize_generic_download_sites(generic_download_sites or [])
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    downloads_dir.mkdir(parents=True, exist_ok=True)
+    if resume:
+        apply_resume_state(refs, output_dir=output_dir, downloads_dir=downloads_dir)
+
+    # 4) Download phases
+    if not no_download:
+        logger = DownloadLogger()
+        secondary_cache: SecondaryLookupCache | None = None
+        cache_str = secondary_cache.strip()
+        if cache_str:
+            cache_path = Path(cache_str)
+            if not cache_path.is_absolute():
+                cache_path = output_dir / cache_path
+            secondary_cache = SecondaryLookupCache(cache_path)
+        initial_refs = refs[:download_max] if download_max > 0 else refs
+        run_initial_download_phase(
+            initial_refs,
+            downloads_dir=downloads_dir,
+            meta_dir=meta_dir,
+            landing_dir=landing_dir,
+            mismatch_dir=mismatch_dir,
+            timeout=timeout,
+            retries=retries,
+            use_doi=not skip_doi,
+            max_candidates_per_item=max_candidates_per_item,
+            workers=workers,
+            show_progress=show_progress,
+            user_agent=user_agent,
+            max_per_domain=max_per_domain,
+            min_domain_delay_ms=min_domain_delay_ms,
+            logger=logger,
+            cookies_jar=cookies_jar,
+            verify_title_rename=verify_title_rename,
+            verify_title_threshold=verify_title_threshold,
+            verify_rename_mode=verify_rename_mode,
+            verify_weights=verify_weights,
+            verified_dir=verified_dir,
+            domain_cookies=domain_cookies,
+            generic_download_sites=sites,
+        )
+        if secondary_lookup:
+            enrich_failed_references(
+                initial_refs,
+                timeout=timeout,
+                lookup_timeout=lookup_timeout,
+                retries=retries,
+                downloads_dir=downloads_dir,
+                meta_dir=meta_dir,
+                landing_dir=landing_dir,
+                mismatch_dir=mismatch_dir,
+                max_items=secondary_max,
+                max_candidates_per_item=max_candidates_per_item,
+                secondary_top_k=secondary_top_k,
+                workers=workers,
+                show_progress=show_progress,
+                user_agent=user_agent,
+                max_per_domain=max_per_domain,
+                min_domain_delay_ms=min_domain_delay_ms,
+                logger=logger,
+                cookies_jar=cookies_jar,
+                verify_title_rename=verify_title_rename,
+                verify_title_threshold=verify_title_threshold,
+                verify_rename_mode=verify_rename_mode,
+                verify_weights=verify_weights,
+                verified_dir=verified_dir,
+                secondary_cache=secondary_cache,
+                unpaywall_email=unpaywall_email,
+                generic_download_sites=sites,
+                api_concurrency=api_concurrency,
+                api_min_delay_ms=api_min_delay_ms,
+                neurips_proceedings=neurips_proceedings,
+            )
+        if download_log:
+            logger.write_csv(output_dir / download_log)
+
+    # 5) Write outputs
+    write_outputs(refs, output_dir)
+
+    # 6) Summary
+    total = len(refs)
+    ok_pdf = sum(1 for r in refs if r.download_status == "downloaded_pdf")
+    ok_landing = sum(1 for r in refs if r.download_status == "saved_landing_url")
+    failed = sum(1 for r in refs if r.download_status == "failed")
+    print(f"Done. Parsed {total} references.")
+    print(f"PDF downloaded: {ok_pdf}, landing URLs saved: {ok_landing}, failed: {failed}")
+    print(f"Output directory: {output_dir.resolve()}")
+
+    if failed > 0:
+        suggest_cookies_configuration(refs, domain_cookies_config, output_dir)
+
+    return refs

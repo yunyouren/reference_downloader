@@ -27,21 +27,10 @@ from __future__ import annotations
 
 import argparse
 import sys
-from http.cookiejar import MozillaCookieJar
 from pathlib import Path
 
 from core.verify import VerifyWeights
-from src.models import ReferenceItem, DownloadLogger, SecondaryLookupCache
-from src.parsers import read_pdf_text, extract_references_section, split_references
-from src.candidates import iter_candidate_urls_with_generic_sites, normalize_generic_download_sites
-from src.downloader import (
-    make_session, load_config_file, load_cookies_txt,
-    apply_resume_state, resolve_downloads_subdir,
-    run_initial_download_phase, enrich_failed_references,
-    load_domain_cookies_config, save_domain_cookies_config,
-    load_domain_cookies, suggest_cookies_configuration,
-)
-from src.output import write_outputs
+from src.downloader import load_config_file, run_pipeline
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -172,20 +161,7 @@ def main() -> None:
     args = parser.parse_args()
     if not args.input:
         parser.error("--input is required (or set 'input' in --config JSON)")
-    cookies_jar: MozillaCookieJar | None = None
-    if args.cookies:
-        cookies_path = Path(args.cookies)
-        if cookies_path.exists():
-            cookies_jar = load_cookies_txt(cookies_path)
-    input_pdf = Path(args.input)
-    output_dir = Path(args.output)
-    downloads_dir = output_dir / "downloads"
-    meta_dir = resolve_downloads_subdir(downloads_dir, str(getattr(args, "meta_subdir", "meta")))
-    landing_dir = resolve_downloads_subdir(downloads_dir, str(getattr(args, "landing_subdir", "landing_urls")))
-    mismatch_dir = resolve_downloads_subdir(downloads_dir, str(getattr(args, "mismatch_subdir", "mismatch_pdfs")))
-    verified_dir: Path | None = None
-    if bool(args.verify_title_rename):
-        verified_dir = resolve_downloads_subdir(downloads_dir, str(getattr(args, "verified_subdir", "verified_pdfs")))
+
     verify_weights = VerifyWeights(
         title_weight=float(getattr(args, "verify_title_weight", 1.0)),
         line_weight=float(getattr(args, "verify_line_weight", 1.0)),
@@ -195,152 +171,49 @@ def main() -> None:
         author_miss_multiplier=float(getattr(args, "verify_author_miss_mult", 0.97)),
     )
 
-    if not input_pdf.exists():
-        raise FileNotFoundError(f"Input PDF does not exist: {input_pdf}")
-    if not input_pdf.is_file():
-        raise ValueError(f"Input PDF is not a file: {input_pdf}")
-    if input_pdf.stat().st_size <= 0:
-        raise ValueError(f"Input PDF is empty: {input_pdf}")
+    cookies_path = Path(args.cookies) if args.cookies and Path(args.cookies).exists() else None
 
-    # 1) 读取全文文本（不同后端对页眉页脚/分栏的抗噪能力不同）
-    try:
-        full_text = read_pdf_text(
-            input_pdf,
-            parser=args.pdf_parser,
-            header_margin=args.header_margin,
-            footer_margin=args.footer_margin,
-        )
-    except Exception as exc:
-        raise RuntimeError(f"Failed to read input PDF: {input_pdf} ({exc})") from exc
-    # 2) 截取参考文献章节，并按风格分段成条目
-    ref_section = extract_references_section(full_text)
-    refs = split_references(ref_section)
-
-    # 3) 域名分析与交互式配置
-    from site_handlers.domain_analyzer import analyze_reference_domains
-    from src.interactive_ui import should_run_interactive, display_domain_summary, configure_cookies_interactively
-
-    # 加载域名cookies配置
-    domain_cookies_file = Path(getattr(args, "domain_cookies_file", "domain_cookies.json"))
-    if not domain_cookies_file.is_absolute():
-        domain_cookies_file = output_dir / domain_cookies_file
-    domain_cookies_config = load_domain_cookies_config(domain_cookies_file)
-
-    # 分析域名
-    domain_info = analyze_reference_domains(refs, domain_cookies_config)
-
-    # 显示域名摘要（始终显示）
-    display_domain_summary(domain_info)
-
-    # 检测是否应该进入交互模式
-    interactive_setting = str(getattr(args, "interactive", "auto"))
-    is_interactive = should_run_interactive(interactive_setting)
-
-    if is_interactive:
-        # 交互式配置cookies
-        new_config = configure_cookies_interactively(domain_info, domain_cookies_config)
-        if new_config != domain_cookies_config:
-            domain_cookies_config = new_config
-            # 保存配置
-            save_domain_cookies_config(domain_cookies_config, domain_cookies_file)
-            print(f"\n已保存域名cookies配置到: {domain_cookies_file}")
-
-    # 加载域名cookies
-    domain_cookies = load_domain_cookies(domain_cookies_config, Path.cwd())
-    generic_download_sites = normalize_generic_download_sites(getattr(args, "generic_download_sites", []))
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    downloads_dir.mkdir(parents=True, exist_ok=True)
-    if bool(getattr(args, "resume", True)):
-        apply_resume_state(refs, output_dir=output_dir, downloads_dir=downloads_dir)
-
-    if not args.no_download:
-        logger = DownloadLogger()
-        secondary_cache: SecondaryLookupCache | None = None
-        cache_str = str(getattr(args, "secondary_cache", "") or "").strip()
-        if cache_str:
-            cache_path = Path(cache_str)
-            if not cache_path.is_absolute():
-                cache_path = output_dir / cache_path
-            secondary_cache = SecondaryLookupCache(cache_path)
-        initial_refs = refs[: args.download_max] if args.download_max > 0 else refs
-        run_initial_download_phase(
-            initial_refs,
-            downloads_dir=downloads_dir,
-            meta_dir=meta_dir,
-            landing_dir=landing_dir,
-            mismatch_dir=mismatch_dir,
-            timeout=args.timeout,
-            retries=args.retries,
-            use_doi=not args.skip_doi,
-            max_candidates_per_item=args.max_candidates_per_item,
-            workers=args.workers,
-            show_progress=not args.no_progress,
-            user_agent=args.user_agent,
-            max_per_domain=args.max_per_domain,
-            min_domain_delay_ms=args.min_domain_delay_ms,
-            logger=logger,
-            cookies_jar=cookies_jar,
-            verify_title_rename=bool(args.verify_title_rename),
-            verify_title_threshold=float(args.verify_title_threshold),
-            verify_rename_mode=str(getattr(args, "verify_rename_mode", "number_and_original")),
-            verify_weights=verify_weights,
-            verified_dir=verified_dir,
-            domain_cookies=domain_cookies,
-            generic_download_sites=generic_download_sites,
-        )
-        if args.secondary_lookup:
-            # 4) 二次检索：只针对失败项补全 DOI/URL 再下载
-            limited_refs = initial_refs
-            enrich_failed_references(
-                limited_refs,
-                timeout=args.timeout,
-                lookup_timeout=args.lookup_timeout,
-                retries=args.retries,
-                downloads_dir=downloads_dir,
-                meta_dir=meta_dir,
-                landing_dir=landing_dir,
-                mismatch_dir=mismatch_dir,
-                max_items=args.secondary_max,
-                max_candidates_per_item=args.max_candidates_per_item,
-                secondary_top_k=int(args.secondary_top_k),
-                workers=args.workers,
-                show_progress=not args.no_progress,
-                user_agent=args.user_agent,
-                max_per_domain=args.max_per_domain,
-                min_domain_delay_ms=args.min_domain_delay_ms,
-                logger=logger,
-                cookies_jar=cookies_jar,
-                verify_title_rename=bool(args.verify_title_rename),
-                verify_title_threshold=float(args.verify_title_threshold),
-                verify_rename_mode=str(getattr(args, "verify_rename_mode", "number_and_original")),
-                verify_weights=verify_weights,
-                verified_dir=verified_dir,
-                secondary_cache=secondary_cache,
-                unpaywall_email=str(getattr(args, "unpaywall_email", "") or ""),
-                generic_download_sites=generic_download_sites,
-                api_concurrency=int(getattr(args, "api_concurrency", 1)),
-                api_min_delay_ms=int(getattr(args, "api_min_delay_ms", 500)),
-                neurips_proceedings=str(getattr(args, "neurips_proceedings", "true")).lower() == "true",
-            )
-        if args.download_log:
-            logger.write_csv(output_dir / args.download_log)
-
-    # 5) 写出最终结果（refs 里含每条的下载状态与文件名）
-    write_outputs(refs, output_dir)
-
-    # 6) 简单汇总输出，便于快速判断成功率
-    total = len(refs)
-    ok_pdf = sum(1 for r in refs if r.download_status == "downloaded_pdf")
-    ok_landing = sum(1 for r in refs if r.download_status == "saved_landing_url")
-    failed = sum(1 for r in refs if r.download_status == "failed")
-    print(f"Done. Parsed {total} references.")
-    print(f"PDF downloaded: {ok_pdf}, landing URLs saved: {ok_landing}, failed: {failed}")
-    print(f"Output directory: {output_dir.resolve()}")
-
-    # 7) 提示用户配置机构 cookies
-    if failed > 0:
-        suggest_cookies_configuration(refs, domain_cookies_config, output_dir)
+    run_pipeline(
+        input_pdf=Path(args.input),
+        output_dir=Path(args.output),
+        pdf_parser=args.pdf_parser,
+        header_margin=args.header_margin,
+        footer_margin=args.footer_margin,
+        timeout=args.timeout,
+        lookup_timeout=args.lookup_timeout,
+        retries=args.retries,
+        cookies_path=cookies_path,
+        verify_title_rename=bool(args.verify_title_rename),
+        verify_rename_mode=str(getattr(args, "verify_rename_mode", "number_and_original")),
+        verify_title_threshold=float(args.verify_title_threshold),
+        verify_weights=verify_weights,
+        verified_subdir=str(getattr(args, "verified_subdir", "verified_pdfs")),
+        meta_subdir=str(getattr(args, "meta_subdir", "meta")),
+        landing_subdir=str(getattr(args, "landing_subdir", "landing_urls")),
+        mismatch_subdir=str(getattr(args, "mismatch_subdir", "mismatch_pdfs")),
+        workers=args.workers,
+        max_per_domain=args.max_per_domain,
+        min_domain_delay_ms=args.min_domain_delay_ms,
+        user_agent=args.user_agent,
+        download_log=args.download_log,
+        unpaywall_email=str(getattr(args, "unpaywall_email", "") or ""),
+        max_candidates_per_item=args.max_candidates_per_item,
+        skip_doi=args.skip_doi,
+        download_max=args.download_max,
+        secondary_lookup=args.secondary_lookup,
+        secondary_max=args.secondary_max,
+        secondary_top_k=int(args.secondary_top_k),
+        secondary_cache=str(getattr(args, "secondary_cache", "") or ""),
+        generic_download_sites=getattr(args, "generic_download_sites", []),
+        domain_cookies_file=str(getattr(args, "domain_cookies_file", "domain_cookies.json")),
+        no_download=args.no_download,
+        resume=bool(getattr(args, "resume", True)),
+        show_progress=not args.no_progress,
+        interactive=str(getattr(args, "interactive", "auto")),
+        api_concurrency=int(getattr(args, "api_concurrency", 1)),
+        api_min_delay_ms=int(getattr(args, "api_min_delay_ms", 500)),
+        neurips_proceedings=str(getattr(args, "neurips_proceedings", "true")).lower() == "true",
+    )
 
 
 if __name__ == "__main__":
