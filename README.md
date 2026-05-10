@@ -1,18 +1,28 @@
 # Reference Tool
 
-学术论文参考文献批量下载工具。从 PDF 论文中自动提取引用列表，并尝试下载对应的 PDF 文件。
+学术论文下载工具集。支持两种模式：从 PDF 批量提取并下载参考文献，以及通过 DOI/标题/URL 快速下载单篇论文。
+
+## 两种使用方式
+
+| | `download_paper.py` | `reference_tool.py` |
+|---|---|---|
+| 输入 | DOI / 标题 / URL | 源论文 PDF |
+| 流程 | 多源搜索 → 直接下载 | 提取参考文献 → 批量下载 |
+| 适用 | "帮我把这篇下回来" | "把这篇引用的文献都下了" |
+| 技能 | `/paper-download` | `/ref-download` |
 
 ## 功能特点
 
-- **多格式引用解析**：支持数字编号 `[1]`、`1.`、`(1)` 及 APA/MLA 风格的非数字引用
-- **并发下载**：多线程并发下载，支持连接复用
-- **二次检索**：对失败条目通过 Crossref/OpenAlex 进行 DOI/URL 反查
-- **开放获取支持**：集成 Unpaywall API，优先查找开放获取版本
+- **多源解析**：出版商直链模板（23家）、Unpaywall OA、arXiv、Semantic Scholar、OpenAlex、Europe PMC
+- **多格式引用解析**：数字编号 `[1]`、`1.`、`(1)` 及 APA/MLA 风格
+- **并发下载**：多线程 + 连接池复用 + 域名限速
+- **二次检索**：Crossref / OpenAlex DOI/URL 反查失败条目
 - **PDF 校验重命名**：下载后验证标题匹配，按论文标题重命名
-- **站点适配**：内置 Springer、IEEE 等站点 HTML 解析器
-- **机构访问支持**：通过 Cookies 复用机构登录态，下载付费内容
-- **断点续传**：支持从上次中断处继续下载
-- **图形界面**：提供 Windows GUI 版本，无需命令行操作
+- **站点适配**：Springer、IEEE 等站点 HTML 解析器
+- **机构访问**：Cookies 复用机构登录态下载付费内容
+- **断点续传**：中断后继续下载
+- **图形界面**：Windows GUI 无需命令行
+- **234 个单元测试**，覆盖率 56%
 
 ## 快速开始
 
@@ -22,61 +32,51 @@
 pip install requests pypdf tqdm pdfplumber
 ```
 
-### 命令行使用
+### 单篇下载（快速）
 
-基础用法：
+```bash
+# 通过 DOI
+python download_paper.py --doi "10.1007/s11071-021-06487-3" --output pdfs/
+
+# 通过标题
+python download_paper.py --title "Neural ODE for Power Converter" --output pdfs/
+
+# 通过 URL
+python download_paper.py --url "https://arxiv.org/pdf/2301.00001.pdf" --output pdfs/
+
+# 带机构 Cookies 下载付费论文
+python download_paper.py --doi "10.1109/TPEL.2023.1234567" --cookies cookies/ieee.txt --output pdfs/
+```
+
+### 批量引用下载
 
 ```bash
 python reference_tool.py --input "你的论文.pdf" --output references_output
 ```
 
-推荐参数（提速 + 二次检索）：
+推荐参数：
 
 ```bash
 python reference_tool.py --input "你的论文.pdf" --output references_output \
     --workers 12 --secondary-lookup --skip-doi --max-candidates-per-item 2 --retries 1
 ```
 
-### 配置文件使用（推荐）
-
-1. 复制配置模板：
-
-```bash
-copy config\reference_tool.config.example.json reference_tool.config.json
-```
-
-2. 编辑 `reference_tool.config.json`，设置输入文件和参数
-
-3. 运行：
-
-```bash
-python reference_tool.py --config reference_tool.config.json
-```
-
 ### 图形界面
-
-运行 GUI 版本：
 
 ```bash
 python reference_tool_gui.py
 ```
 
-或直接使用打包好的可执行文件：
-
-```
-dist/ReferenceTool.exe
-```
-
-GUI 功能：
-- 可视化选择输入 PDF、输出目录、配置文件、Cookies 文件
-- 配置常用运行参数（线程数、超时、重试、二次检索等）
-- 加载/保存 JSON 配置文件
-- 实时显示下载日志
-- 支持中英文界面
-
 ## 输出文件
 
-运行后在输出目录生成：
+### 单篇下载
+
+```
+pdfs/
+└── paper.pdf              # 下载的 PDF 文件
+```
+
+### 批量下载
 
 ```
 references_output/
@@ -86,146 +86,112 @@ references_output/
 ├── download_log.csv         # 下载尝试日志
 └── downloads/
     ├── meta/                # 条目原文
-    │   └── 001_meta.txt
     ├── verified_pdfs/       # 校验通过的 PDF
-    │   └── 001_Title_of_paper.pdf
     ├── mismatch_pdfs/       # 校验不通过的 PDF
-    │   └── 001__mismatch.pdf
     └── landing_urls/        # 落地页链接
-        └── 001_landing.url.txt
 ```
 
-## 高级配置
-
-### 使用机构 Cookies
-
-通过配置机构登录态的 Cookies，可以下载需要订阅的期刊内容。
-
-1. 在浏览器中登录机构图书馆（确保能下载 PDF）
-2. 使用浏览器扩展导出 Cookies（JSON 或 Netscape 格式）
-3. 配置域名映射文件 `domain_cookies.json`：
-
-```json
-{
-  "version": 1,
-  "domains": {
-    "link.aps.org": {
-      "cookies_path": "cookies/aps.json",
-      "description": "学校图书馆 - APS"
-    },
-    "pubs.acs.org": {
-      "cookies_path": "cookies/acs.json",
-      "description": "学校图书馆 - ACS"
-    }
-  }
-}
-```
-
-详细配置说明见 [docs/cookies_setup_guide.md](docs/cookies_setup_guide.md)。
-
-### 常用参数说明
+## 常用参数
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `--workers` | 并发线程数 | 8 |
-| `--timeout` | 单次下载超时（秒） | 20 |
+| `--timeout` | HTTP 超时（秒） | 20 |
 | `--retries` | 重试次数 | 1 |
 | `--secondary-lookup` | 启用二次检索 | false |
-| `--secondary-max` | 二次检索最大条目数 | 40 |
 | `--verify-title-rename` | 校验并按标题重命名 | false |
-| `--verify-title-threshold` | 标题匹配阈值 | 0.55 |
-| `--pdf-parser` | PDF 解析器 (pypdf/pdfplumber) | pypdf |
+| `--pdf-parser` | PDF 解析器 (pypdf/pdfplumber) | pdfplumber |
 | `--resume` | 断点续传 | true |
 | `--skip-doi` | 跳过 DOI 直连 | false |
-| `--max-candidates-per-item` | 每条最大候选链接数 | 3 |
 | `--unpaywall-email` | Unpaywall API 邮箱 | 空 |
 
-### 通用下载站点
+## 机构 Cookies
 
-可在配置文件中自定义下载站点模板：
+通过 Cookies 复用机构登录态下载付费内容：
+
+1. 浏览器登录机构图书馆
+2. 导出 Cookies（JSON 或 Netscape 格式）到 `cookies/`
+3. 配置 `domain_cookies.json`：
 
 ```json
 {
-  "generic_download_sites": [
-    "https://arxiv.org/search/?query={title_encoded}&searchtype=all",
-    "https://www.semanticscholar.org/search?q={title_encoded}",
-    "https://core.ac.uk/search?q=doi:{doi_encoded}",
-    "https://www.base-search.net/Search/Results?lookfor={title_encoded}&type=all&oaboost=1",
-    "https://doaj.org/search/articles/{title_encoded}"
-  ]
+  "link.springer.com": {
+    "cookies_path": "cookies/springer.json",
+    "description": "学校图书馆 - Springer"
+  }
 }
 ```
 
-支持的占位符：`{doi}`、`{doi_encoded}`、`{title}`、`{title_encoded}`
+详细说明见 [docs/cookies_setup_guide.md](docs/cookies_setup_guide.md)。
 
 ## 目录结构
 
 ```
 .
-├── reference_tool.py              # 命令行主程序
-├── reference_tool_gui.py          # GUI 主程序
-├── config/                           # 配置模板
-│   └── reference_tool.config.example.json
-├── src/                               # 内部模块
-│   └── interactive_ui.py
-├── core/                          # 核心工具模块
+├── download_paper.py               # 单篇快速下载
+├── reference_tool.py               # 命令行主程序（参考文献批量下载）
+├── reference_tool_gui.py           # GUI 主程序
+├── src/
+│   ├── models.py                   # 数据模型（ReferenceItem, PipelineConfig 等）
+│   ├── parsers.py                  # PDF 引用解析
+│   ├── candidates.py               # URL 候选生成与站点适配
+│   ├── lookup.py                   # 20 个 API 查找函数
+│   ├── _doi_templates.py           # DOI 前缀 → 出版商 PDF URL 映射
+│   ├── downloader.py               # 下载管线
+│   ├── output.py                   # 输出写入（Markdown/CSV/JSON）
+│   └── interactive_ui.py           # 交互式终端 UI
+├── core/
 │   ├── http.py
 │   ├── html.py
 │   ├── urls.py
 │   └── verify.py
-├── site_handlers/                 # 站点适配器
+├── site_handlers/
 │   ├── registry.py
 │   ├── springer.py
 │   ├── ieee.py
 │   └── domain_analyzer.py
-├── scripts/                       # 构建与启动脚本
-│   ├── build_exe.py
-│   └── run_reference_tool.ps1
-├── docs/                          # 文档
-│   └── cookies_setup_guide.md
-├── tests/                         # 单元测试
-├── cookies/                       # 机构 Cookies（不入 git）
-└── dist/                          # 打包输出（不入 git）
+├── tests/                          # 234 个单元测试
+├── docs/
+├── cookies/                        # 机构 Cookies（不入 git）
+└── dist/                           # 打包输出（不入 git）
 ```
 
-## 开发指南
+## 开发
 
 ### 运行测试
 
 ```bash
-python -m pytest tests/
+python -m pytest tests/ -v
+# 覆盖率
+python -m pytest tests/ -q --cov=src --cov-report=term-missing
 ```
 
-### 添加新站点适配器
+当前：234 passed，覆盖率 56%。
 
-1. 在 `site_handlers/` 目录下创建新文件，如 `new_site.py`
-2. 实现 PDF 链接提取函数：
+### 添加新 DOI 模板
+
+编辑 `src/_doi_templates.py`：
 
 ```python
-def extract_new_site_pdf_url(html: str, url: str) -> str | None:
-    """从 HTML 中提取 PDF 直链。"""
-    # 解析逻辑
-    return pdf_url
+DOI_URL_TEMPLATES: list[tuple[str, str]] = [
+    # prefix → template, {doi} or {suffix} placeholder
+    ("10.1007/", "https://link.springer.com/content/pdf/{doi}.pdf"),
+    # ...
+]
 ```
 
-3. 在 `site_handlers/registry.py` 中注册域名
+### 添加新查找源
 
-### 打包可执行文件
+在 `src/lookup.py` 中添加函数：
 
-```bash
-pip install pyinstaller
-python scripts/build_exe.py
+```python
+def lookup_example_pdf_urls_by_title(
+    session: requests.Session, expected_title: str, timeout: int
+) -> list[str]:
+    """通过标题搜索 Example API 获取 PDF 链接。"""
+    ...
 ```
-
-打包后的文件位于 `dist/ReferenceTool_Release/` 目录。
 
 ## 许可证
 
 MIT License
-
-## 注意事项
-
-1. **Cookies 安全**：Cookies 文件包含登录凭证，请勿分享或提交到版本控制
-2. **合理使用**：请遵守出版商的使用条款，仅用于个人学术研究
-3. **请求频率**：建议设置适当的 `--min-domain-delay-ms` 避免被限流
-4. **Cookies 有效期**：Cookies 通常有过期时间，过期后需重新导出
