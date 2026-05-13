@@ -36,7 +36,7 @@ cookies/
 cookies.txt
 reference_tool.config.json
 domain_cookies.json
-.claude/
+.claude/settings.local.json
 
 # Generated outputs
 references_output*/
