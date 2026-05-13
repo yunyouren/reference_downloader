@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import os
 import re
+import sys
 from urllib.parse import urlparse
+
+
+_DEBUG = os.environ.get("REFERENCE_DEBUG") or os.environ.get("DEBUG")
 
 
 def normalize_candidate_url(url: str) -> str:
@@ -29,6 +34,8 @@ def normalize_candidate_url(url: str) -> str:
                     return f"https://linkinghub.elsevier.com/retrieve/pii/{pii}"
             return ""
     except Exception:
+        if _DEBUG:
+            print(f"[DEBUG urls] normalize_candidate_url failed on {url!r}", file=sys.stderr)
         return raw
 
     return raw

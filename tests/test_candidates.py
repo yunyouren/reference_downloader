@@ -3,8 +3,8 @@ from src._doi_templates import build_doi_candidate, DOI_URL_TEMPLATES
 from src.candidates import (
     normalize_generic_download_sites,
     build_generic_site_candidates,
-    resolve_downloads_subdir,
 )
+from src.downloader import resolve_downloads_subdir
 from src.models import ReferenceItem
 from pathlib import Path
 

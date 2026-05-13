@@ -4,7 +4,7 @@ from typing import Iterable
 
 import requests
 
-from .springer import collect_stream_text
+from core import collect_stream_text
 from .registry import HandlerResult, register
 
 

@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import math
+import os
+import sys
 from datetime import datetime
 from email.utils import parsedate_to_datetime
+
+
+_DEBUG = os.environ.get("REFERENCE_DEBUG") or os.environ.get("DEBUG")
 
 
 def is_probably_pdf(first_bytes: bytes) -> bool:
@@ -19,7 +24,8 @@ def parse_retry_after_seconds(value: str) -> float | None:
         if math.isfinite(seconds):
             return max(0.0, seconds)
     except Exception:
-        pass
+        if _DEBUG:
+            print(f"[DEBUG http] parse_retry_after_seconds(float) failed on {raw!r}", file=sys.stderr)
     try:
         dt = parsedate_to_datetime(raw)
         if dt is None:
@@ -28,6 +34,8 @@ def parse_retry_after_seconds(value: str) -> float | None:
         seconds = (dt - now).total_seconds()
         return max(0.0, seconds)
     except Exception:
+        if _DEBUG:
+            print(f"[DEBUG http] parse_retry_after_seconds(date) failed on {raw!r}", file=sys.stderr)
         return None
 
 

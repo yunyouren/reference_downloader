@@ -7,31 +7,23 @@ as well as custom journal sites.
 
 from __future__ import annotations
 
-import time as _time
+import json
 import random as _random
+import re
+import time as _time
+from pathlib import Path
 from typing import Iterable
+from urllib.parse import urljoin, urlparse
 
 import requests
 
 from .registry import HandlerResult, register
+from core import collect_stream_text
 
-
-def _collect_stream_text(
-    first_chunk: bytes, chunks: Iterable[bytes], limit_bytes: int = 1024 * 1024 * 2
-) -> str:
-    buf = bytearray()
-    if first_chunk:
-        buf.extend(first_chunk[: min(len(first_chunk), 1024 * 1024)])
-    for chunk in chunks:
-        if not chunk:
-            continue
-        remaining = limit_bytes - len(buf)
-        if remaining <= 0:
-            break
-        buf.extend(chunk[:remaining])
-        if len(buf) >= limit_bytes:
-            break
-    return buf.decode("utf-8", errors="ignore")
+try:
+    from pdfplumber import open as pdfplumber_open
+except ImportError:
+    pdfplumber_open = None
 
 
 # Domains of major Chinese electrical engineering journals
@@ -86,7 +78,7 @@ def handle_chinese_journal_html(
     extract_chinese_journal_pdf_url = helpers["extract_chinese_journal_pdf_url"]
     DownloadAttempt = helpers["DownloadAttempt"]
 
-    html_text = _collect_stream_text(first_chunk, chunks)
+    html_text = collect_stream_text(first_chunk, chunks)
     pdf_url = extract_chinese_journal_pdf_url(html_text, base_url=final_url)
     if not pdf_url or pdf_url in seen:
         return "unhandled"

@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import csv
 import json
+import os
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+
+_DEBUG = os.environ.get("REFERENCE_DEBUG") or os.environ.get("DEBUG")
 
 
 @dataclass
@@ -93,6 +98,8 @@ class SecondaryLookupCache:
             try:
                 self._data = json.loads(self._path.read_text(encoding="utf-8")) or {}
             except Exception:
+                if _DEBUG:
+                    print(f"[DEBUG models] SecondaryLookupCache failed to load {self._path}", file=sys.stderr)
                 self._data = {}
 
     def get(self, key: str) -> tuple[list[str], list[str]] | None:

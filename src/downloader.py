@@ -18,13 +18,13 @@ import sys
 import threading
 import time
 import hashlib
+import os
 from http.cookiejar import Cookie, MozillaCookieJar
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Iterable
 from urllib.parse import quote, urljoin, urlparse
 
 import requests  # type: ignore[import-untyped]
@@ -65,6 +65,8 @@ from src.lookup import (
 from src.parsers import read_pdf_text, extract_references_section, split_references
 from src.output import write_outputs
 
+_DEBUG = os.environ.get("REFERENCE_DEBUG") or os.environ.get("DEBUG")
+
 try:
     from tqdm import tqdm  # type: ignore[import-untyped]
 except ImportError:  # pragma: no cover
@@ -82,6 +84,8 @@ def apply_resume_state(refs: list[ReferenceItem], output_dir: Path, downloads_di
     try:
         data = json.loads(state_file.read_text(encoding="utf-8"))
     except Exception:
+        if _DEBUG:
+            print(f"[DEBUG downloader] Failed to parse resume state: {state_file}", file=sys.stderr)
         return
     if not isinstance(data, list):
         return
@@ -195,6 +199,8 @@ def load_cookies_txt(path: Path) -> MozillaCookieJar:
                 if len(jar) > 0:
                     return jar
         except Exception:
+            if _DEBUG:
+                print(f"[DEBUG downloader] JSON cookie parsing failed", file=sys.stderr)
             pass
 
     jar = MozillaCookieJar(str(path))
@@ -297,22 +303,6 @@ def load_config_file(path: Path) -> dict:
 # ---------------------------------------------------------------------------
 # Download and verification
 # ---------------------------------------------------------------------------
-
-def collect_stream_text(first_chunk: bytes, chunks: Iterable[bytes], limit_bytes: int = 1024 * 1024 * 2) -> str:
-    buf = bytearray()
-    if first_chunk:
-        buf.extend(first_chunk[: min(len(first_chunk), 1024 * 1024)])
-    for chunk in chunks:
-        if not chunk:
-            continue
-        remaining = limit_bytes - len(buf)
-        if remaining <= 0:
-            break
-        buf.extend(chunk[:remaining])
-        if len(buf) >= limit_bytes:
-            break
-    return buf.decode("utf-8", errors="ignore")
-
 
 def resolve_downloads_subdir(downloads_dir: Path, subdir: str) -> Path | None:
     name = str(subdir or "").strip()
@@ -1207,6 +1197,8 @@ def load_domain_cookies_config(path: Path) -> dict[str, dict]:
                 return data.get("domains", {})
             return {k: v for k, v in data.items() if isinstance(v, dict) and "cookies_path" in v}
     except Exception:
+        if _DEBUG:
+            print(f"[DEBUG downloader] Failed to load domain cookies config: {path}", file=sys.stderr)
         pass
     return {}
 
@@ -1270,6 +1262,8 @@ def suggest_cookies_configuration(
                     failed_refs_by_domain[hostname].append(ref.number)
                     has_source = True
             except Exception:
+                if _DEBUG:
+                    print(f"[DEBUG downloader] URL parsing failed in suggest_cookies_configuration", file=sys.stderr)
                 pass
 
         # 如果没有 DOI/URL，尝试从文本中提取出版商
@@ -1602,18 +1596,22 @@ def load_domain_cookies(
                 jar = load_cookies_txt(path)
                 result[domain] = jar
             except Exception:
+                if _DEBUG:
+                    print(f"[DEBUG downloader] Failed to load cookie jar for {domain}: {path}", file=sys.stderr)
                 pass
     return result
 
 
-def run_pipeline(
+def run_pipeline_from_refs(
+    refs: list[ReferenceItem],
     cfg: PipelineConfig,
     *,
     verify_weights: VerifyWeights | None = None,
 ) -> list[ReferenceItem]:
-    """Run the full reference extraction and download pipeline.
+    """Run download pipeline from pre-parsed reference items.
 
     Args:
+        refs: Pre-parsed reference items (from PDF, docx, or any source).
         cfg: PipelineConfig with all settings.
         verify_weights: Optional custom VerifyWeights override.
 
@@ -1639,30 +1637,7 @@ def run_pipeline(
     if cfg.verify_title_rename:
         verified_dir = resolve_downloads_subdir(downloads_dir, cfg.verified_subdir)
 
-    # Validate input
-    if not cfg.input_pdf.exists():
-        raise FileNotFoundError(f"Input PDF does not exist: {cfg.input_pdf}")
-    if not cfg.input_pdf.is_file():
-        raise ValueError(f"Input PDF is not a file: {cfg.input_pdf}")
-    if cfg.input_pdf.stat().st_size <= 0:
-        raise ValueError(f"Input PDF is empty: {cfg.input_pdf}")
-
-    # 1) Read PDF text
-    try:
-        full_text = read_pdf_text(
-            cfg.input_pdf,
-            parser=cfg.pdf_parser,
-            header_margin=cfg.header_margin,
-            footer_margin=cfg.footer_margin,
-        )
-    except Exception as exc:
-        raise RuntimeError(f"Failed to read input PDF: {cfg.input_pdf} ({exc})") from exc
-
-    # 2) Extract references section and split into items
-    ref_section = extract_references_section(full_text)
-    refs = split_references(ref_section)
-
-    # 3) Domain analysis and interactive configuration
+    # Domain analysis and interactive configuration
     domain_cookies_file_path = Path(cfg.domain_cookies_file)
     if not domain_cookies_file_path.is_absolute():
         domain_cookies_file_path = cfg.output_dir / domain_cookies_file_path
@@ -1689,7 +1664,7 @@ def run_pipeline(
     if cfg.resume:
         apply_resume_state(refs, output_dir=cfg.output_dir, downloads_dir=downloads_dir)
 
-    # 4) Download phases
+    # Download phases
     if not cfg.no_download:
         logger = DownloadLogger()
         secondary_cache: SecondaryLookupCache | None = None
@@ -1760,10 +1735,10 @@ def run_pipeline(
         if cfg.download_log:
             logger.write_csv(cfg.output_dir / cfg.download_log)
 
-    # 5) Write outputs
+    # Write outputs
     write_outputs(refs, cfg.output_dir)
 
-    # 6) Summary
+    # Summary
     total = len(refs)
     ok_pdf = sum(1 for r in refs if r.download_status == "downloaded_pdf")
     ok_landing = sum(1 for r in refs if r.download_status == "saved_landing_url")
@@ -1776,3 +1751,42 @@ def run_pipeline(
         suggest_cookies_configuration(refs, domain_cookies_config, cfg.output_dir)
 
     return refs
+
+
+def run_pipeline(
+    cfg: PipelineConfig,
+    *,
+    verify_weights: VerifyWeights | None = None,
+) -> list[ReferenceItem]:
+    """Run the full reference extraction and download pipeline from a PDF.
+
+    Args:
+        cfg: PipelineConfig with all settings.
+        verify_weights: Optional custom VerifyWeights override.
+
+    Returns the list of reference items with download status populated.
+    """
+    # Validate PDF input
+    if not cfg.input_pdf.exists():
+        raise FileNotFoundError(f"Input PDF does not exist: {cfg.input_pdf}")
+    if not cfg.input_pdf.is_file():
+        raise ValueError(f"Input PDF is not a file: {cfg.input_pdf}")
+    if cfg.input_pdf.stat().st_size <= 0:
+        raise ValueError(f"Input PDF is empty: {cfg.input_pdf}")
+
+    # Read PDF text
+    try:
+        full_text = read_pdf_text(
+            cfg.input_pdf,
+            parser=cfg.pdf_parser,
+            header_margin=cfg.header_margin,
+            footer_margin=cfg.footer_margin,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read input PDF: {cfg.input_pdf} ({exc})") from exc
+
+    # Extract and parse references
+    ref_section = extract_references_section(full_text)
+    refs = split_references(ref_section)
+
+    return run_pipeline_from_refs(refs, cfg, verify_weights=verify_weights)

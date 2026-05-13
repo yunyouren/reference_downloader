@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import time
 from pathlib import Path
@@ -54,36 +55,36 @@ def _try_fetch_pdf(
     session: requests.Session,
     url: str,
     timeout: int,
-) -> tuple[bytes | None, str]:
-    """Try to fetch a URL; return (content, final_url) if it looks like PDF."""
+) -> tuple[bytes | None, str, str]:
+    """Try to fetch a URL; return (content, final_url, content_type) if it looks like PDF."""
     try:
         resp = session.get(url, timeout=timeout, stream=True, allow_redirects=True)
         if not resp.ok:
-            return None, ""
+            return None, "", ""
         ct = (resp.headers.get("content-type") or "").lower()
         final_url = resp.url or url
 
         content = resp.content
         # Check PDF signature
         if content[:5] == b"%PDF-":
-            return content, final_url
+            return content, final_url, ct
         if "application/pdf" in ct:
-            return content, final_url
+            return content, final_url, ct
         if final_url.lower().endswith(".pdf"):
-            return content, final_url
-        return None, ""
+            return content, final_url, ct
+        return None, "", ""
     except requests.RequestException:
-        return None, ""
+        return None, "", ""
 
 
 def _resolve_filename(url: str, content_type: str | None = None) -> str:
     """Derive a clean filename from URL or Content-Disposition header."""
-    # Try to extract from URL path
     path = urlparse(url).path
     name = Path(path).name
     if name and name.lower().endswith(".pdf"):
         return name
-    # Fallback
+    if content_type and "application/pdf" in content_type.lower():
+        return "paper.pdf"
     return "paper.pdf"
 
 
@@ -145,9 +146,9 @@ def download_paper(
             break
 
         print(f"  [{tried}] Trying: {url[:100]}...")
-        content, final_url = _try_fetch_pdf(session, url, timeout)
+        content, final_url, content_type = _try_fetch_pdf(session, url, timeout)
         if content is not None:
-            filename = _resolve_filename(final_url)
+            filename = _resolve_filename(final_url, content_type)
             if not filename.lower().endswith(".pdf"):
                 filename = f"{filename}.pdf"
             output_path = output_dir / filename

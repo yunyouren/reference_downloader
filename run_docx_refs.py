@@ -19,24 +19,7 @@ from docx import Document
 from core.verify import VerifyWeights
 from src.models import PipelineConfig
 from src.parsers import split_references
-from src.downloader import (
-    load_config_file,
-    make_session,
-    load_cookies_txt,
-    load_domain_cookies_config,
-    load_domain_cookies,
-    resolve_downloads_subdir,
-    normalize_generic_download_sites,
-    save_domain_cookies_config,
-    apply_resume_state,
-    run_initial_download_phase,
-    enrich_failed_references,
-    DownloadLogger,
-    SecondaryLookupCache,
-)
-from src.output import write_outputs
-from site_handlers.domain_analyzer import analyze_reference_domains
-from src.interactive_ui import should_run_interactive, display_domain_summary, configure_cookies_interactively
+from src.downloader import load_config_file, run_pipeline_from_refs
 
 
 def extract_text_from_docx(docx_path: Path) -> str:
@@ -118,26 +101,23 @@ def main() -> None:
     if not docx_path.exists():
         raise FileNotFoundError(f"Input .docx does not exist: {docx_path}")
 
-    # 1) 从 .docx 提取文本
+    # Extract text from .docx
     print(f"Reading .docx: {docx_path}")
     full_text = extract_text_from_docx(docx_path)
     if not full_text.strip():
         raise ValueError(f"No text extracted from {docx_path}")
     print(f"Extracted {len(full_text)} characters from document.")
 
-    # 2) 解析参考文献（整个文档就是参考文献列表）
+    # Parse references (entire document is reference list)
     refs = split_references(full_text)
     print(f"Parsed {len(refs)} references.")
 
-    # 3) 构建配置
+    # Build config
     cookies_path = Path(args.cookies) if args.cookies and Path(args.cookies).exists() else None
 
     cfg = PipelineConfig(
-        input_pdf=docx_path,  # 仅用于记录来源
+        input_pdf=docx_path,
         output_dir=Path(args.output),
-        pdf_parser="pypdf",
-        header_margin=40.0,
-        footer_margin=40.0,
         timeout=args.timeout,
         lookup_timeout=args.lookup_timeout,
         retries=args.retries,
@@ -182,132 +162,8 @@ def main() -> None:
         author_miss_multiplier=float(getattr(args, "verify_author_miss_mult", 0.97)),
     )
 
-    # 4) 域名cookies配置
-    domain_cookies_file_path = Path(cfg.domain_cookies_file)
-    if not domain_cookies_file_path.is_absolute():
-        domain_cookies_file_path = cfg.output_dir / domain_cookies_file_path
-
-    domain_cookies_config = cfg.domain_cookies_config
-    if domain_cookies_config is None:
-        domain_cookies_config = load_domain_cookies_config(domain_cookies_file_path)
-
-    domain_info = analyze_reference_domains(refs, domain_cookies_config)
-    display_domain_summary(domain_info)
-
-    is_interactive = should_run_interactive(cfg.interactive)
-    if is_interactive:
-        new_config = configure_cookies_interactively(domain_info, domain_cookies_config)
-        if new_config != domain_cookies_config:
-            domain_cookies_config = new_config
-            save_domain_cookies_config(domain_cookies_config, domain_cookies_file_path)
-            print(f"\n已保存域名cookies配置到: {domain_cookies_file_path}")
-
-    domain_cookies = load_domain_cookies(domain_cookies_config, Path.cwd())
-    sites = normalize_generic_download_sites(cfg.generic_download_sites or [])
-
-    cfg.output_dir.mkdir(parents=True, exist_ok=True)
-    downloads_dir = cfg.output_dir / "downloads"
-    downloads_dir.mkdir(parents=True, exist_ok=True)
-
-    meta_dir = resolve_downloads_subdir(downloads_dir, cfg.meta_subdir)
-    landing_dir = resolve_downloads_subdir(downloads_dir, cfg.landing_subdir)
-    mismatch_dir = resolve_downloads_subdir(downloads_dir, cfg.mismatch_subdir)
-    verified_dir = resolve_downloads_subdir(downloads_dir, cfg.verified_subdir) if cfg.verify_title_rename else None
-
-    if cfg.resume:
-        apply_resume_state(refs, output_dir=cfg.output_dir, downloads_dir=downloads_dir)
-
-    # 5) 下载阶段
-    if not cfg.no_download:
-        logger = DownloadLogger()
-        secondary_cache: SecondaryLookupCache | None = None
-        cache_str = cfg.secondary_cache.strip()
-        if cache_str:
-            cache_path = Path(cache_str)
-            if not cache_path.is_absolute():
-                cache_path = cfg.output_dir / cache_path
-            secondary_cache = SecondaryLookupCache(cache_path)
-
-        global_jar = load_cookies_txt(cookies_path) if cookies_path else None
-
-        initial_refs = refs[:cfg.download_max] if cfg.download_max > 0 else refs
-        run_initial_download_phase(
-            initial_refs,
-            downloads_dir=downloads_dir,
-            meta_dir=meta_dir,
-            landing_dir=landing_dir,
-            mismatch_dir=mismatch_dir,
-            timeout=cfg.timeout,
-            retries=cfg.retries,
-            use_doi=not cfg.skip_doi,
-            max_candidates_per_item=cfg.max_candidates_per_item,
-            workers=cfg.workers,
-            show_progress=cfg.show_progress,
-            user_agent=cfg.user_agent,
-            max_per_domain=cfg.max_per_domain,
-            min_domain_delay_ms=cfg.min_domain_delay_ms,
-            logger=logger,
-            cookies_jar=global_jar,
-            verify_title_rename=cfg.verify_title_rename,
-            verify_title_threshold=cfg.verify_title_threshold,
-            verify_rename_mode=cfg.verify_rename_mode,
-            verify_weights=verify_weights,
-            verified_dir=verified_dir,
-            domain_cookies=domain_cookies,
-            generic_download_sites=sites,
-        )
-
-        if cfg.secondary_lookup:
-            enrich_failed_references(
-                initial_refs,
-                timeout=cfg.timeout,
-                lookup_timeout=cfg.lookup_timeout,
-                retries=cfg.retries,
-                downloads_dir=downloads_dir,
-                meta_dir=meta_dir,
-                landing_dir=landing_dir,
-                mismatch_dir=mismatch_dir,
-                max_items=cfg.secondary_max,
-                max_candidates_per_item=cfg.max_candidates_per_item,
-                secondary_top_k=cfg.secondary_top_k,
-                workers=cfg.workers,
-                show_progress=cfg.show_progress,
-                user_agent=cfg.user_agent,
-                max_per_domain=cfg.max_per_domain,
-                min_domain_delay_ms=cfg.min_domain_delay_ms,
-                logger=logger,
-                cookies_jar=global_jar,
-                verify_title_rename=cfg.verify_title_rename,
-                verify_title_threshold=cfg.verify_title_threshold,
-                verify_rename_mode=cfg.verify_rename_mode,
-                verify_weights=verify_weights,
-                verified_dir=verified_dir,
-                secondary_cache=secondary_cache,
-                unpaywall_email=cfg.unpaywall_email,
-                generic_download_sites=sites,
-                api_concurrency=cfg.api_concurrency,
-                api_min_delay_ms=cfg.api_min_delay_ms,
-                neurips_proceedings=cfg.neurips_proceedings,
-            )
-
-        if cfg.download_log:
-            logger.write_csv(cfg.output_dir / cfg.download_log)
-
-    # 6) 写入输出
-    write_outputs(refs, cfg.output_dir)
-
-    # 7) 摘要
-    total = len(refs)
-    ok_pdf = sum(1 for r in refs if r.download_status == "downloaded_pdf")
-    ok_landing = sum(1 for r in refs if r.download_status == "saved_landing_url")
-    failed = sum(1 for r in refs if r.download_status == "failed")
-    print(f"Done. Parsed {total} references.")
-    print(f"PDF downloaded: {ok_pdf}, landing URLs saved: {ok_landing}, failed: {failed}")
-    print(f"Output directory: {cfg.output_dir.resolve()}")
-
-    if failed > 0:
-        from src.downloader import suggest_cookies_configuration
-        suggest_cookies_configuration(refs, domain_cookies_config, cfg.output_dir)
+    # Delegate to shared pipeline
+    run_pipeline_from_refs(refs, cfg, verify_weights=verify_weights)
 
 
 if __name__ == "__main__":

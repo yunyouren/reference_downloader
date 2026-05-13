@@ -8,11 +8,21 @@ ChemRxiv, ResearchGate, NeurIPS proceedings) to find PDF URLs and DOIs for refer
 
 from __future__ import annotations
 
+import os
 import re
+import sys
 import time
 import xml.etree.ElementTree as ET
 from typing import Iterable
 from urllib.parse import quote, urljoin
+
+
+_DEBUG = os.environ.get("REFERENCE_DEBUG") or os.environ.get("DEBUG")
+
+
+def _debug_err(msg: str) -> None:
+    if _DEBUG:
+        print(f"[DEBUG lookup] {msg}", file=sys.stderr)
 
 import requests  # type: ignore[import-untyped]
 
@@ -220,8 +230,8 @@ def lookup_secondary_ranked(
                             urls=urls,
                         )
                     )
-    except Exception:
-        pass
+    except Exception as _e:
+        _debug_err(f"Crossref lookup failed: {type(_e).__name__}: {_e}")
 
     try:
         openalex_params: dict[str, str | int] = {"search": expected, "per-page": 5}
@@ -283,10 +293,9 @@ def lookup_secondary_ranked(
                             urls=urls,
                         )
                     )
-    except Exception:
+    except Exception as _e:
+        _debug_err(f"Crossref lookup failed: {type(_e).__name__}: {_e}")
         pass
-
-    # Baidu Scholar — Chinese literature source
     try:
         bd_urls = lookup_baidu_xueshu_pdf_urls_by_title(session, expected, timeout=timeout)
         if bd_urls:
@@ -302,8 +311,8 @@ def lookup_secondary_ranked(
                         urls=urls,
                     )
                 )
-    except Exception:
-        pass
+    except Exception as _e:
+        _debug_err(f"Baidu Scholar lookup failed: {type(_e).__name__}: {_e}")
 
     candidates.sort(key=lambda c: (c.score, 1 if c.doi else 0, len(c.urls)), reverse=True)
     selected = candidates if top_k <= 0 else candidates[: max(1, top_k)]

@@ -2,3 +2,4 @@ requests>=2.28
 pypdf>=3.0
 pdfplumber>=0.7
 tqdm>=4.64
+python-docx>=0.8
