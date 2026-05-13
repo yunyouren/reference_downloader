@@ -55,7 +55,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lookup-timeout", type=int, default=6, help="Secondary lookup API timeout seconds")
     parser.add_argument("--retries", type=int, default=1, help="Retries per candidate URL")
     parser.add_argument("--cookies", help="cookies.txt (Netscape) path for authenticated downloads")
-    parser.add_argument("--verify-title-rename", action="store_true", help="Verify downloaded PDF title and rename on match")
+    parser.add_argument("--verify-title-rename", dest="verify_title_rename", action="store_true", default=True, help="Verify downloaded PDF title and rename on match (default: on)")
+    parser.add_argument("--no-verify-title-rename", dest="verify_title_rename", action="store_false", help="Disable title verification and renaming")
     parser.add_argument(
         "--verify-rename-mode",
         choices=["original", "number_only", "number_and_original"],

@@ -51,7 +51,17 @@ from src.models import (
     SecondaryLookupCache, DomainLimiter, PipelineConfig,
 )
 from src.candidates import iter_candidate_urls_with_generic_sites, normalize_generic_download_sites
-from src.lookup import lookup_secondary_ranked, guess_title_query
+from src.lookup import (
+    lookup_secondary_ranked, guess_title_query, parse_ref_year,
+    parse_first_author_surname, unique_preserve_order, is_neurips_reference,
+    lookup_neurips_proceedings_pdf_urls_by_title, lookup_arxiv_pdf_urls_by_title,
+    lookup_semanticscholar_pdf_urls_by_title, lookup_europepmc_pdf_urls_by_title,
+    lookup_biorxiv_pdf_urls_by_title, lookup_core_pdf_urls_by_title,
+    lookup_openalex_pdf_urls_by_title, lookup_crossref_tdm_urls,
+    lookup_google_books_pdf_urls, lookup_ssrn_pdf_urls_by_title,
+    lookup_chemrxiv_pdf_urls_by_title, lookup_researchgate_pdf_urls_by_title,
+    lookup_unpaywall, lookup_unpaywall_by_title,
+)
 from src.parsers import read_pdf_text, extract_references_section, split_references
 from src.output import write_outputs
 

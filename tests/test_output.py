@@ -24,8 +24,9 @@ class TestWriteOutputs(unittest.TestCase):
         md = self.out / "numbered_references.md"
         self.assertTrue(md.exists())
         content = md.read_text(encoding="utf-8")
-        self.assertIn("[1] Smith, J.", content)
-        self.assertIn("[2] Brown, T.", content)
+        self.assertIn("Smith, J.", content)
+        self.assertIn("Brown, T.", content)
+        self.assertIn("📄", content)  # status icon for downloaded pdf
 
     def test_creates_json_file(self):
         write_outputs(self.refs, self.out)

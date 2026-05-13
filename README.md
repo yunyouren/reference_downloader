@@ -99,7 +99,8 @@ references_output/
 | `--timeout` | HTTP 超时（秒） | 20 |
 | `--retries` | 重试次数 | 1 |
 | `--secondary-lookup` | 启用二次检索 | false |
-| `--verify-title-rename` | 校验并按标题重命名 | false |
+| `--verify-title-rename` | 校验并按标题重命名 | true |
+| `--no-verify-title-rename` | 关闭标题校验重命名 | — |
 | `--pdf-parser` | PDF 解析器 (pypdf/pdfplumber) | pdfplumber |
 | `--resume` | 断点续传 | true |
 | `--skip-doi` | 跳过 DOI 直连 | false |
