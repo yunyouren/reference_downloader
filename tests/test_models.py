@@ -67,7 +67,7 @@ def test_download_logger_thread_safe():
         tmp = Path(f.name)
     try:
         logger.write_csv(tmp)
-        lines = tmp.read_text().splitlines()
+        lines = tmp.read_text(encoding="utf-8-sig").splitlines()
         assert len(lines) == 51  # header + 50 rows
         assert "phase,ref_number" in lines[0]
     finally:
@@ -101,9 +101,9 @@ def test_secondary_lookup_cache_get_set():
         assert dois == ["10.1234/foo"]
         assert urls == ["https://example.com"]
 
-        # Empty set shouldn't write
+        # Empty results are cached briefly to avoid repeated lookups.
         cache.set("key2", [], [])
-        assert cache.get("key2") is None
+        assert cache.get("key2") == ([], [])
     finally:
         tmp.unlink(missing_ok=True)
 

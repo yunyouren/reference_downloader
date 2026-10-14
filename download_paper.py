@@ -19,7 +19,6 @@ from pathlib import Path
 from urllib.parse import urlparse, quote
 
 import requests
-from requests.adapters import HTTPAdapter
 
 # Reuse existing infrastructure where available
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -35,20 +34,17 @@ from src.lookup import (
     lookup_biorxiv_pdf_urls_by_title,
     unique_preserve_order,
 )
-from src.downloader import load_cookies_txt
+from src.downloader import load_cookies_txt, make_session as make_download_session, merge_cookie_jars
+from core.pdf_files import is_readable_pdf, save_pdf_stream
+from core.verify import sanitize_filename_component
+from core.verify import assess_pdf
+from core.pdf_files import move_without_overwrite
 
 
 def make_session(user_agent: str, cookies_path: Path | None = None) -> requests.Session:
-    session = requests.Session()
-    adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16, max_retries=0)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    session.headers.update({"User-Agent": user_agent})
-    if cookies_path:
-        jar = load_cookies_txt(cookies_path)
-        for cookie in jar:
-            session.cookies.set_cookie(cookie)
-    return session
+    jar = load_cookies_txt(cookies_path) if cookies_path else None
+    return make_download_session(pool_size=16, user_agent=user_agent,
+                                 cookies_jar=merge_cookie_jars(jar, None))
 
 
 def _try_fetch_pdf(
@@ -56,7 +52,8 @@ def _try_fetch_pdf(
     url: str,
     timeout: int,
 ) -> tuple[bytes | None, str, str]:
-    """Try to fetch a URL; return (content, final_url, content_type) if it looks like PDF."""
+    """Accept only structurally readable PDFs, never trust a suffix or MIME type."""
+    resp = None
     try:
         resp = session.get(url, timeout=timeout, stream=True, allow_redirects=True)
         if not resp.ok:
@@ -65,16 +62,14 @@ def _try_fetch_pdf(
         final_url = resp.url or url
 
         content = resp.content
-        # Check PDF signature
-        if content[:5] == b"%PDF-":
-            return content, final_url, ct
-        if "application/pdf" in ct:
-            return content, final_url, ct
-        if final_url.lower().endswith(".pdf"):
+        if is_readable_pdf(content):
             return content, final_url, ct
         return None, "", ""
     except requests.RequestException:
         return None, "", ""
+    finally:
+        if resp is not None:
+            resp.close()
 
 
 def _resolve_filename(url: str, content_type: str | None = None) -> str:
@@ -82,7 +77,7 @@ def _resolve_filename(url: str, content_type: str | None = None) -> str:
     path = urlparse(url).path
     name = Path(path).name
     if name and name.lower().endswith(".pdf"):
-        return name
+        return (sanitize_filename_component(name[:-4]) or "paper") + ".pdf"
     if content_type and "application/pdf" in content_type.lower():
         return "paper.pdf"
     return "paper.pdf"
@@ -137,6 +132,7 @@ def download_paper(
     output_dir: Path,
     timeout: int,
     max_try: int = 5,
+    *, expected_title: str = "", expected_doi: str = "",
 ) -> Path | None:
     """Try candidates sequentially; save the first valid PDF found."""
     tried = 0
@@ -151,11 +147,18 @@ def download_paper(
             filename = _resolve_filename(final_url, content_type)
             if not filename.lower().endswith(".pdf"):
                 filename = f"{filename}.pdf"
-            output_path = output_dir / filename
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_bytes(content)
-            print(f"  -> Saved: {output_path}")
-            return output_path
+            output_path = save_pdf_stream(output_dir / filename, [content])
+            if output_path is not None:
+                decision = assess_pdf(out_file=output_path, expected_title=expected_title,
+                    expected_dois=[expected_doi] if expected_doi else [], ref_year=None,
+                    surname="", verify_title_threshold=.65, verify_weights=None,
+                    check_identity=bool(expected_title or expected_doi), source_url=final_url)
+                if decision.outcome == "downloaded_pdf":
+                    print(f"  -> Saved: {output_path}")
+                    return output_path
+                folder = "review_pdfs" if decision.outcome == "needs_review" else "rejected_pdfs"
+                retained = move_without_overwrite(output_path, output_dir / folder / output_path.name)
+                print(f"  -> Not confirmed as main text ({decision.reason}): {retained}")
 
         # Brief pause between candidates
         if tried < min(max_try, len(candidates)):
@@ -203,7 +206,8 @@ def main():
         sys.exit(1)
 
     print("Downloading...")
-    result = download_paper(session, candidates, output_dir, args.timeout, args.max_try)
+    result = download_paper(session, candidates, output_dir, args.timeout, args.max_try,
+                            expected_title=args.title or "", expected_doi=args.doi or "")
 
     if result:
         print(f"\nSuccess: {result}")

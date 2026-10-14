@@ -7,7 +7,7 @@ from core.verify import build_verified_pdf_name, verify_and_rename_pdf
 
 class _DummyPage:
     def __init__(self, text: str) -> None:
-        self._text = text
+        self._text = text + "\n1. Introduction\n" + "This paper describes the experimental setup and reports measured results. " * 6
 
     def extract_text(self):
         return self._text

@@ -5,6 +5,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
+from difflib import SequenceMatcher
+from core.document import clean_text, front_matter, read_document
+from core.pdf_files import move_without_overwrite
 
 try:
     from pypdf import PdfReader
@@ -13,7 +16,7 @@ except ImportError:  # pragma: no cover
 
 
 def sanitize_filename_component(text: str, max_len: int = 90) -> str:
-    s = (text or "").strip()
+    s = clean_text(text).strip()
     s = re.sub(r"[\\/:*?\"<>|\x00-\x1F]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     if len(s) > max_len:
@@ -39,9 +42,7 @@ def move_verified_pdf(out_file: Path, downloads_dir: Path, verified_dir: Path | 
     if verified_dir is None:
         return out_file, out_file.name
     verified_dir.mkdir(parents=True, exist_ok=True)
-    dest = unique_path(verified_dir / out_file.name)
-    if dest.resolve() != out_file.resolve():
-        out_file.replace(dest)
+    dest = move_without_overwrite(out_file, verified_dir / out_file.name)
     rel = dest.relative_to(downloads_dir).as_posix()
     return dest, rel
 
@@ -88,7 +89,7 @@ def normalize_title_tokens(text: str) -> list[str]:
     so that ``title_match_score`` works for Chinese-only, English-only, and
     mixed-language titles.
     """
-    raw = (text or "").lower()
+    raw = clean_text(text).lower()
     raw = re.sub(r"[‐-―−]", "-", raw)
     raw = re.sub(rf"[^a-z0-9{_CJK_RANGE}]+", " ", raw)
 
@@ -136,6 +137,10 @@ def normalize_title_tokens(text: str) -> list[str]:
 
 
 def title_match_score(pdf_title: str, expected_title: str) -> float:
+    compact = lambda text: re.sub(r"[^a-z0-9一-鿿]", "", clean_text(text).casefold())
+    left, right = compact(pdf_title), compact(expected_title)
+    if len(left) >= 16 and left == right:
+        return 1.0
     a = set(normalize_title_tokens(pdf_title))
     b = set(normalize_title_tokens(expected_title))
     if not a or not b:
@@ -289,7 +294,7 @@ def compute_verify_score(
 
 @dataclass
 class VerifyDecision:
-    outcome: Literal["downloaded_pdf", "pdf_title_mismatch"]
+    outcome: Literal["downloaded_pdf", "pdf_title_mismatch", "needs_review", "non_main_pdf"]
     score: float
     title_score: float
     line_score: float
@@ -299,6 +304,104 @@ class VerifyDecision:
     best_line: str
     file_path: Path
     rel_path: str
+    document_kind: str = "unknown"
+    reason: str = ""
+    identity_match: str = ""
+
+
+def _best_title_lines(page_texts: list[str], expected: str) -> tuple[float, str]:
+    best_score, best_line = 0.0, ""
+    if page_texts and (len(page_texts[0]) >= 1500 or re.search(r"(?im)^\s*(?:abstract|摘要|[IVX\d. ]*introduction)\b", page_texts[0])):
+        page_texts = page_texts[:1]
+    for text in page_texts:
+        text = front_matter(text)
+        text = re.sub(r"(?<=\w)\s*\n\s*[-‐‑]\s*\n\s*(?=\w)", "-", text)
+        text = re.split(r"(?im)^\s*(?:abstract|[IVX\d. ]*introduction|摘要)\b", text, maxsplit=1)[0]
+        lines = [re.sub(r"\s+", " ", clean_text(line)).strip() for line in text.splitlines()[:80]]
+        lines = [line for line in lines if line]
+        for start in range(len(lines)):
+            for width in range(1, 5):
+                line = " ".join(lines[start:start + width])
+                if not 12 <= len(line) <= 360:
+                    continue
+                # Keep the semantic hyphen, joining a wrap without an extra space.
+                line = re.sub(r"([-‐‑])\s+(?=\w)", r"\1", line)
+                score = title_match_score(line, expected)
+                if score > best_score:
+                    best_score, best_line = score, line
+    return best_score, best_line
+
+
+def assess_pdf(*, out_file: Path, expected_title: str, ref_year: int | None,
+               surname: str, verify_title_threshold: float, verify_weights,
+               expected_dois: list[str] | None = None, expected_identifiers: list[str] | None = None,
+               source_url: str = "", check_identity: bool = True, expected_kind: str = "",
+               reader_cls=PdfReader) -> VerifyDecision:
+    evidence = read_document(out_file, reader_cls=reader_cls, source_url=source_url)
+    title_score = title_match_score(evidence.title, expected_title)
+    line_score, best_line = _best_title_lines(evidence.page_texts, expected_title)
+    page_text = front_matter("\n".join(evidence.page_texts)).lower()
+    year_hit = bool(ref_year) and str(ref_year) in page_text
+    author_hit = bool(surname) and surname.lower() in page_text
+    score = compute_verify_score(title_score=title_score, line_score=line_score,
+        year_present=bool(ref_year), year_hit=year_hit, author_present=bool(surname),
+        author_hit=author_hit, weights=coerce_verify_weights(verify_weights))
+    first_page = front_matter(evidence.page_texts[0] if evidence.page_texts else "")
+    primary_lines = [line for line in first_page.splitlines() if
+        re.search(r"(?i)^\s*(?:doi\s*:|https?://(?:dx\.)?doi\.org/)|digital object identifier", line)]
+    identity_text = evidence.metadata_text + "\n" + "\n".join(primary_lines)
+    found_dois = {d.rstrip(".,;)").casefold() for d in re.findall(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", identity_text)}
+    wanted = {re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", "", d.strip(), flags=re.I).casefold().rstrip(".,;)") for d in (expected_dois or [])}
+    doi_hit = bool(wanted & found_dois)
+    def patent_ids(text):
+        values = set()
+        for country, number, kind, digit in re.findall(r"\b(US|EP|WO|AT|CN)\s*([0-9][0-9 ,./-]{3,24})\s*([ABC])\s*(\d?)", text, flags=re.I):
+            number = re.sub(r"\D", "", number).lstrip("0")
+            values.add((country.upper(), number, kind.upper(), digit))
+        return values
+    wanted_patents = patent_ids("\n".join(expected_identifiers or []))
+    # Patent bibliographies do not establish the patent's own publication number.
+    found_patents = patent_ids(evidence.title)
+    if not found_patents:
+        first_patent = re.search(r"\b(?:US|EP|WO|AT|CN)\s*[0-9][0-9 ,./-]{3,24}\s*[ABC]\s*\d?", first_page[:600], flags=re.I)
+        found_patents = patent_ids(first_patent.group()) if first_patent else set()
+    patent_hit = bool(wanted_patents & found_patents)
+    identity = "doi" if doi_hit else "identifier" if patent_hit else "title" if score >= verify_title_threshold else ""
+    # A near-spelling title needs independent author/year evidence, and cannot
+    # change numeric ratings. This is not a lower global title threshold.
+    compact = lambda text: re.sub(r"[^a-z0-9一-鿿]", "", clean_text(text).casefold())
+    independent = (bool(ref_year) or bool(surname)) and (not ref_year or year_hit) and (not surname or author_hit)
+    if not identity and independent:
+        for candidate in (evidence.title, best_line):
+            a, b = compact(candidate), compact(expected_title)
+            if min(len(a), len(b)) >= 24 and re.findall(r"\d+", a) == re.findall(r"\d+", b) and SequenceMatcher(None, a, b).ratio() >= .96:
+                identity = "title_spelling_with_author_year"
+                break
+    conflict = (bool(wanted) and bool(found_dois) and not doi_hit) or (bool(wanted_patents) and bool(found_patents) and not patent_hit)
+    chosen_title = evidence.title if title_score >= line_score else best_line
+    chosen_title = re.sub(r"^\s*(?:[IVX]+(?:\.\d+)+\.?|\d+(?:\.\d+)*[.)])\s+", "", chosen_title)
+    expected_numbers = re.findall(r"\d+(?:\.\d+)?", expected_title)
+    actual_numbers = re.findall(r"\d+(?:\.\d+)?", chosen_title)
+    numeric_conflict = identity not in {"doi", "identifier"} and bool(expected_numbers and actual_numbers) and expected_numbers != actual_numbers
+    if evidence.kind in {"supplementary", "preview", "abstract"}:
+        outcome, reason = "non_main_pdf", evidence.reason
+    elif evidence.kind in {"unknown", "unreadable"}:
+        outcome, reason = "needs_review", evidence.reason
+    elif evidence.kind == "presentation" and expected_kind != "presentation":
+        outcome, reason = "needs_review", "presentation_not_expected_for_article"
+    elif conflict and check_identity:
+        outcome, reason = "needs_review", "identifier_conflict"
+    elif numeric_conflict and check_identity:
+        outcome, reason = "needs_review", "title_numeric_conflict"
+    elif not identity and check_identity and (not evidence.title.strip() or evidence.title.casefold() in {"powerpoint presentation", "microsoft word", "untitled", "unknown"}):
+        outcome, reason = "needs_review", "identity_not_extractable"
+    elif not check_identity or identity:
+        outcome, reason = "downloaded_pdf", evidence.reason
+    else:
+        outcome, reason = "pdf_title_mismatch", "identity_not_confirmed"
+    return VerifyDecision(outcome, float(score), float(title_score), float(line_score),
+        bool(year_hit), bool(author_hit), evidence.title, best_line, out_file, out_file.name,
+        evidence.kind, reason, identity)
 
 
 def verify_and_rename_pdf(
@@ -315,60 +418,28 @@ def verify_and_rename_pdf(
     verify_weights,
     verify_rename_mode: RenameMode = "number_and_original",
     reader_cls=PdfReader,
+    expected_dois: list[str] | None = None,
+    expected_identifiers: list[str] | None = None,
+    source_url: str = "",
+    check_identity: bool = True,
+    expected_kind: str = "",
 ) -> VerifyDecision:
-    pdf_title = extract_pdf_title_from_file(out_file, reader_cls=reader_cls) or ""
-    title_score = title_match_score(pdf_title, expected_title)
-    line_score, best_line = extract_pdf_best_line_score(out_file, expected_title, reader_cls=reader_cls)
-    page_text = extract_pdf_first_page_text(out_file, reader_cls=reader_cls).lower()
-    year_hit = bool(ref_year) and str(ref_year) in page_text
-    author_hit = bool(surname) and surname in page_text
-
-    weights = coerce_verify_weights(verify_weights)
-    score = compute_verify_score(
-        title_score=title_score,
-        line_score=line_score,
-        year_present=bool(ref_year),
-        year_hit=bool(year_hit),
-        author_present=bool(surname),
-        author_hit=bool(author_hit),
-        weights=weights,
-    )
-
-    if score >= float(verify_title_threshold):
-        name_source = best_line if (line_score * float(weights.line_weight)) > (title_score * float(weights.title_weight)) and best_line else pdf_title
+    decision = assess_pdf(out_file=out_file, expected_title=expected_title, ref_year=ref_year,
+        surname=surname, verify_title_threshold=verify_title_threshold, verify_weights=verify_weights,
+        expected_dois=expected_dois, expected_identifiers=expected_identifiers, source_url=source_url,
+        check_identity=check_identity, expected_kind=expected_kind, reader_cls=reader_cls)
+    if decision.outcome == "downloaded_pdf":
+        # A known reference title is more trustworthy than a PDF producer's metadata.
+        name_source = expected_title or decision.best_line or decision.pdf_title
         target_name = build_verified_pdf_name(prefix=prefix, original_name=(name_source or expected_title), rename_mode=verify_rename_mode)
         desired = downloads_dir / target_name
         if desired.resolve() != out_file.resolve():
-            renamed = unique_path(desired)
-            if renamed.name != out_file.name:
-                out_file.replace(renamed)
-                out_file = renamed
+            out_file = move_without_overwrite(out_file, desired)
         out_file, rel_path = move_verified_pdf(out_file, downloads_dir=downloads_dir, verified_dir=verified_dir)
-        return VerifyDecision(
-            outcome="downloaded_pdf",
-            score=float(score),
-            title_score=float(title_score),
-            line_score=float(line_score),
-            year_hit=bool(year_hit),
-            author_hit=bool(author_hit),
-            pdf_title=pdf_title,
-            best_line=best_line,
-            file_path=out_file,
-            rel_path=rel_path,
-        )
-
-    mismatch_file = unique_path((mismatch_dir or downloads_dir) / f"{prefix}__mismatch.pdf")
-    out_file.replace(mismatch_file)
-    rel_path = mismatch_file.relative_to(downloads_dir).as_posix() if mismatch_file.is_relative_to(downloads_dir) else mismatch_file.name
-    return VerifyDecision(
-        outcome="pdf_title_mismatch",
-        score=float(score),
-        title_score=float(title_score),
-        line_score=float(line_score),
-        year_hit=bool(year_hit),
-        author_hit=bool(author_hit),
-        pdf_title=pdf_title,
-        best_line=best_line,
-        file_path=mismatch_file,
-        rel_path=rel_path,
-    )
+    else:
+        folder = (downloads_dir / "review_pdfs") if decision.outcome == "needs_review" else (mismatch_dir or downloads_dir)
+        tag = "review" if decision.outcome == "needs_review" else "non_main" if decision.outcome == "non_main_pdf" else "mismatch"
+        out_file = move_without_overwrite(out_file, folder / f"{prefix}__{tag}.pdf")
+        rel_path = out_file.relative_to(downloads_dir).as_posix()
+    decision.file_path, decision.rel_path = out_file, rel_path
+    return decision

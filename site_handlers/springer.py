@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from typing import Iterable
+from itertools import chain
 
 import requests
 
 from .registry import HandlerResult, register
 from core import collect_stream_text
+from core.pdf_files import save_pdf_stream
 
 
 @register(["link.springer.com"])
@@ -69,7 +71,7 @@ def handle_springer_html(
                     error="",
                 )
             )
-            _time.sleep(waited_s)
+            helpers.get("wait", _time.sleep)(waited_s)
             return "retry"
         if not pdf_response.ok:
             logger.add(
@@ -97,54 +99,45 @@ def handle_springer_html(
         if not (pdf_first_chunk and is_probably_pdf(pdf_first_chunk)):
             return "continue"
 
-        out_file = downloads_dir / f"{prefix}.pdf"
-        tmp_file = downloads_dir / f"{prefix}.pdf.part"
-        try:
-            with tmp_file.open("wb") as f:
-                f.write(pdf_first_chunk)
-                for chunk in pdf_chunks:
-                    if chunk:
-                        f.write(chunk)
-            tmp_file.replace(out_file)
-            if verify_title_rename:
-                handled = verify_downloaded_pdf_and_update_item(
-                    item=item,
-                    out_file=out_file,
-                    downloads_dir=downloads_dir,
-                    verified_dir=verified_dir,
-                    mismatch_dir=mismatch_dir,
-                    final_url=final_pdf_url,
-                    candidate_url=pdf_url,
-                    status_code=int(pdf_response.status_code),
-                    content_type=(pdf_response.headers.get("content-type") or ""),
-                    phase=phase,
-                    logger=logger,
-                    verify_title_threshold=float(verify_title_threshold),
-                    verify_rename_mode=str(verify_rename_mode or "number_and_original"),
-                    verify_weights=verify_weights,
-                )
-                return "downloaded" if item.download_status == "downloaded_pdf" else "continue"
-
-            item.download_status = "downloaded_pdf"
-            item.downloaded_file = out_file.name
-            item.note = final_pdf_url
-            logger.add(
-                DownloadAttempt(
-                    phase=phase,
-                    ref_number=item.number,
-                    candidate_url=pdf_url,
-                    final_url=final_pdf_url,
-                    status_code=int(pdf_response.status_code),
-                    content_type=(pdf_response.headers.get("content-type") or ""),
-                    outcome="downloaded_pdf",
-                    waited_seconds=0.0,
-                    error="",
-                )
+        out_file = save_pdf_stream(downloads_dir / f"{prefix}.pdf", chain([pdf_first_chunk], pdf_chunks))
+        if out_file is None:
+            return "continue"
+        if verify_title_rename:
+            handled = verify_downloaded_pdf_and_update_item(
+                item=item,
+                out_file=out_file,
+                downloads_dir=downloads_dir,
+                verified_dir=verified_dir,
+                mismatch_dir=mismatch_dir,
+                final_url=final_pdf_url,
+                candidate_url=pdf_url,
+                status_code=int(pdf_response.status_code),
+                content_type=(pdf_response.headers.get("content-type") or ""),
+                phase=phase,
+                logger=logger,
+                verify_title_threshold=float(verify_title_threshold),
+                verify_rename_mode=str(verify_rename_mode or "number_and_original"),
+                verify_weights=verify_weights,
             )
-            return "downloaded"
-        finally:
-            if tmp_file.exists():
-                tmp_file.unlink(missing_ok=True)
+            return "downloaded" if item.download_status == "downloaded_pdf" else "continue"
+
+        item.download_status = "downloaded_pdf"
+        item.downloaded_file = out_file.name
+        item.note = final_pdf_url
+        logger.add(
+            DownloadAttempt(
+                phase=phase,
+                ref_number=item.number,
+                candidate_url=pdf_url,
+                final_url=final_pdf_url,
+                status_code=int(pdf_response.status_code),
+                content_type=(pdf_response.headers.get("content-type") or ""),
+                outcome="downloaded_pdf",
+                waited_seconds=0.0,
+                error="",
+            )
+        )
+        return "downloaded"
     finally:
         if pdf_response is not None:
             pdf_response.close()

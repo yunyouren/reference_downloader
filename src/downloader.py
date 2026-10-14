@@ -19,8 +19,10 @@ import threading
 import time
 import hashlib
 import os
+from copy import copy, deepcopy
+from itertools import chain
 from http.cookiejar import Cookie, MozillaCookieJar
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from email.utils import parsedate_to_datetime
@@ -31,7 +33,11 @@ import requests  # type: ignore[import-untyped]
 from requests.adapters import HTTPAdapter  # type: ignore[import-untyped]
 
 import site_handlers
+from core import collect_stream_text
 from core.http import is_probably_pdf, parse_retry_after_seconds, should_record_landing_url
+from core.pdf_files import contained_file, file_sha256, is_readable_pdf, save_pdf_stream
+from core.document import VERIFICATION_VERSION
+from core.runtime import RunControl, RunCancelled, ControlledSession, LimitedAdapter
 from core.html import extract_springer_pdf_url, extract_chinese_journal_pdf_url, extract_ieee_arnumber, extract_ieee_pdf_url
 from core.urls import normalize_candidate_url
 from core.verify import (
@@ -45,6 +51,7 @@ from core.verify import (
     title_match_score,
     unique_path,
     verify_and_rename_pdf,
+    assess_pdf,
 )
 from src.models import (
     ReferenceItem, DownloadAttempt, DownloadLogger,
@@ -62,7 +69,7 @@ from src.lookup import (
     lookup_chemrxiv_pdf_urls_by_title, lookup_researchgate_pdf_urls_by_title,
     lookup_unpaywall, lookup_unpaywall_by_title,
 )
-from src.parsers import read_pdf_text, extract_references_section, split_references
+from src.parsers import read_pdf_text, extract_references_section, split_references, DOI_RE
 from src.output import write_outputs
 
 _DEBUG = os.environ.get("REFERENCE_DEBUG") or os.environ.get("DEBUG")
@@ -76,6 +83,24 @@ except ImportError:  # pragma: no cover
 # ---------------------------------------------------------------------------
 # Session and config
 # ---------------------------------------------------------------------------
+
+def _same_reference(item: ReferenceItem, row: dict) -> bool:
+    def doi_set(values) -> set[str]:
+        if not isinstance(values, list):
+            return set()
+        return {re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", "", str(value).strip(), flags=re.I).casefold().rstrip(".,;")
+                for value in values if str(value).strip()}
+
+    current_dois, old_dois = doi_set(item.dois), doi_set(row.get("dois"))
+    if current_dois and old_dois:
+        return bool(current_dois & old_dois)
+    # Legacy manifests with no identity must be retried, not matched by number.
+    old_text = row.get("text")
+    if not isinstance(old_text, str) or not old_text.strip():
+        return False
+    normalize = lambda text: re.sub(r"\s+", " ", text).strip().casefold()
+    return bool(item.text.strip()) and normalize(item.text) == normalize(old_text)
+
 
 def apply_resume_state(refs: list[ReferenceItem], output_dir: Path, downloads_dir: Path) -> None:
     state_file = output_dir / "references.json"
@@ -98,46 +123,85 @@ def apply_resume_state(refs: list[ReferenceItem], output_dir: Path, downloads_di
         except Exception:
             continue
         item = by_num.get(num)
-        if item is None:
+        if item is None or not _same_reference(item, row):
             continue
         status = str(row.get("download_status") or "")
         downloaded_file = str(row.get("downloaded_file") or "")
         note = str(row.get("note") or "")
-        if status not in {"downloaded_pdf", "saved_landing_url"}:
+        if status not in {"downloaded_pdf", "saved_landing_url", "needs_review"}:
             continue
-        p = downloads_dir / downloaded_file if downloaded_file else None
-        if p is not None and p.exists():
-            item.download_status = status
-            item.downloaded_file = downloaded_file
-            item.note = note
+        p = contained_file(downloads_dir, downloaded_file)
+        if p is None:
             continue
-        if status == "downloaded_pdf":
-            prefix = f"{num:03d}"
-            matches = list(downloads_dir.rglob(f"{prefix}*.pdf"))
-            matches = [m for m in matches if m.is_file()]
-            matches = [m for m in matches if "__mismatch" not in m.name]
-            if len(matches) == 1:
-                rel = matches[0].relative_to(downloads_dir).as_posix()
-                item.download_status = status
-                item.downloaded_file = rel
-                item.note = note
+        if status == "saved_landing_url":
+            # Preserve a useful candidate, but a landing page is not completion.
+            try:
+                url = p.read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeError):
+                continue
+            if urlparse(url).scheme in {"http", "https"}:
+                item.urls = unique_preserve_order(item.urls + [url])
+            continue
+        if not is_readable_pdf(p):
+            continue
+        expected_hash = row.get("file_sha256")
+        if expected_hash:
+            try:
+                if file_sha256(p) != expected_hash:
+                    continue
+            except OSError:
+                continue
+        item.download_status = status
+        item.downloaded_file = p.relative_to(downloads_dir.resolve()).as_posix()
+        item.note = note
+        item.document_kind = str(row.get("document_kind") or "")
+        item.verification_reason = str(row.get("verification_reason") or "")
+        item.identity_checked = row.get("identity_checked") is True
+        try:
+            item.verification_version = int(row.get("verification_version") or 0)
+        except (ValueError, TypeError):
+            item.verification_version = 0
 
 
-def make_session(pool_size: int, user_agent: str, cookies_jar: MozillaCookieJar | None) -> requests.Session:
+def merge_cookie_jars(
+    cookies_jar: MozillaCookieJar | None,
+    domain_cookies: dict[str, MozillaCookieJar] | None,
+) -> MozillaCookieJar | None:
+    """Use one domain-scoped jar per session, including DOI redirects and fallbacks.
+
+    Requests selects applicable cookies for each URL, including redirects. Never
+    turn cookies into a global Cookie header. Configured jars override duplicates.
+    """
+    if cookies_jar is None and not domain_cookies:
+        return None
+    merged = MozillaCookieJar()
+    jars = ([cookies_jar] if cookies_jar is not None else []) + list((domain_cookies or {}).values())
+    for jar in jars:
+        for cookie in jar:
+            # A domainless cookie would be sent to unrelated hosts by requests.
+            if cookie.domain:
+                merged.set_cookie(copy(cookie))
+    return merged
+
+
+def make_session(pool_size: int, user_agent: str, cookies_jar: MozillaCookieJar | None,
+                 *, control: RunControl | None = None, domain_limiter=None, api_limiter=None) -> requests.Session:
     """
     创建带连接池的 requests.Session，用于多线程下载时复用连接。
 
     - pool_size: HTTPAdapter 的连接池大小（连接数上限）
     - user_agent: 便于对端识别的 UA（避免一些站点拦截默认 UA）
     """
-    session = requests.Session()
-    adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size, max_retries=0)
+    session = ControlledSession(control) if control is not None else requests.Session()
+    adapter_kwargs = dict(pool_connections=pool_size, pool_maxsize=pool_size, max_retries=0)
+    adapter = LimitedAdapter(control=control, domain_limiter=domain_limiter,
+        api_limiter=api_limiter, **adapter_kwargs) if control is not None else HTTPAdapter(**adapter_kwargs)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     session.headers.update({"User-Agent": user_agent})
     if cookies_jar is not None:
         for cookie in cookies_jar:
-            session.cookies.set_cookie(cookie)
+            session.cookies.set_cookie(copy(cookie))
     return session
 
 
@@ -329,6 +393,7 @@ def verify_downloaded_pdf_and_update_item(
     verify_title_threshold: float,
     verify_rename_mode: str,
     verify_weights,
+    check_identity: bool = True,
 ) -> bool:
     prefix = f"{item.number:03d}"
     expected = guess_title_query(item.text)
@@ -346,12 +411,21 @@ def verify_downloaded_pdf_and_update_item(
         verify_title_threshold=float(verify_title_threshold),
         verify_rename_mode=str(verify_rename_mode or "number_and_original"),
         verify_weights=verify_weights,
+        expected_dois=DOI_RE.findall(item.text),
+        expected_identifiers=re.findall(r"\b(?:AT|US|EP|WO|CN)\s?\d[\d /-]{4,18}\s?[ABC]\d?\b", item.text, flags=re.I),
+        source_url=final_url,
+        check_identity=check_identity,
+        expected_kind="presentation" if re.search(r"keynote|tutorial|presentation|lecture|slides|演讲|课件", item.text, flags=re.I) else "",
     )
+    item.document_kind = decision.document_kind
+    item.verification_reason = decision.reason
+    item.verification_version = VERIFICATION_VERSION
+    item.identity_checked = check_identity
     if decision.outcome == "downloaded_pdf":
         item.download_status = "downloaded_pdf"
         item.downloaded_file = decision.rel_path
         item.note = (
-            f"{final_url} | title_match={decision.score:.3f} | title_score={decision.title_score:.3f} | line_score={decision.line_score:.3f} | year_hit={int(decision.year_hit)} | author_hit={int(decision.author_hit)}"
+            f"{final_url} | identity={decision.identity_match} | kind={decision.document_kind} | title_match={decision.score:.3f} | title_score={decision.title_score:.3f} | line_score={decision.line_score:.3f} | year_hit={int(decision.year_hit)} | author_hit={int(decision.author_hit)}"
         )
         logger.add(
             DownloadAttempt(
@@ -375,11 +449,19 @@ def verify_downloaded_pdf_and_update_item(
             final_url=final_url,
             status_code=int(status_code),
             content_type=content_type,
-            outcome="pdf_title_mismatch",
+            outcome=decision.outcome,
             waited_seconds=0.0,
-            error=f"score={decision.score:.3f}; title_score={decision.title_score:.3f}; line_score={decision.line_score:.3f}; year_hit={int(decision.year_hit)}; author_hit={int(decision.author_hit)}; best_line={decision.best_line[:120]}; pdf_title={decision.pdf_title[:120]}",
+            error=f"reason={decision.reason}; kind={decision.document_kind}; file={decision.rel_path}; score={decision.score:.3f}; title_score={decision.title_score:.3f}; line_score={decision.line_score:.3f}; year_hit={int(decision.year_hit)}; author_hit={int(decision.author_hit)}; best_line={decision.best_line[:120]}; pdf_title={decision.pdf_title[:120]}",
         )
     )
+    if decision.outcome == "needs_review":
+        item.download_status = "needs_review"
+        item.downloaded_file = decision.rel_path
+        item.note = f"{final_url} | review={decision.reason}"
+    else:
+        item.download_status = "failed"
+        item.downloaded_file = ""
+        item.note = f"{final_url} | rejected={decision.reason}"
     return True
 
 
@@ -403,20 +485,42 @@ def try_download(
     verify_weights: VerifyWeights | dict | None,
     verified_dir: Path | None,
     generic_download_sites: list[str] | None = None,
+    control: RunControl | None = None,
 ) -> None:
     """
     尝试为单条参考文献下载 PDF，或保存落地页 URL。
 
     输出策略：
     - 总是写入 00X_meta.txt（条目原文，便于人工追溯）；
-    - 若请求返回 PDF（Content-Type 或 url 后缀判断），保存为 00X.pdf；
+    - PDF 必须通过文件头和结构校验，保存时保留原编号且不覆盖旧文件；
     - 否则保存最终跳转的落地页 URL 到 00X_landing.url.txt。
     """
     prefix = f"{item.number:03d}"
-    if item.download_status in {"downloaded_pdf", "saved_landing_url"} and item.downloaded_file:
-        existing = downloads_dir / item.downloaded_file
-        if existing.exists():
-            return
+    control = control or RunControl()
+    control.check()
+    if item.download_status == "downloaded_pdf" and item.downloaded_file:
+        existing = contained_file(downloads_dir, item.downloaded_file)
+        if existing is not None and is_readable_pdf(existing):
+            if item.verification_version == VERIFICATION_VERSION and (not verify_title_rename or item.identity_checked):
+                return
+            decision = assess_pdf(out_file=existing, expected_title=guess_title_query(item.text),
+                ref_year=parse_ref_year(item.text), surname=parse_first_author_surname(item.text),
+                verify_title_threshold=verify_title_threshold, verify_weights=verify_weights,
+                expected_dois=DOI_RE.findall(item.text), check_identity=verify_title_rename,
+                expected_identifiers=re.findall(r"\b(?:AT|US|EP|WO|CN)\s?\d[\d /-]{4,18}\s?[ABC]\d?\b", item.text, flags=re.I),
+                expected_kind="presentation" if re.search(r"keynote|tutorial|presentation|lecture|slides|演讲|课件", item.text, flags=re.I) else "")
+            item.verification_version = VERIFICATION_VERSION
+            item.identity_checked = verify_title_rename
+            item.document_kind, item.verification_reason = decision.document_kind, decision.reason
+            if decision.outcome == "downloaded_pdf":
+                return
+            if decision.outcome == "needs_review":
+                item.download_status = "needs_review"
+                item.note = f"Existing PDF needs review: {decision.reason}"
+    best_review = deepcopy(item) if item.download_status == "needs_review" else None
+    item.download_status = "not_attempted"
+    item.downloaded_file = ""
+    item.note = ""
     meta_file = (meta_dir or downloads_dir) / f"{prefix}_meta.txt"
     meta_file.write_text(item.text + "\n", encoding="utf-8")
 
@@ -431,6 +535,7 @@ def try_download(
         use_doi=use_doi,
         generic_download_sites=generic_download_sites,
     ):
+        control.check()
         if candidate in seen:
             continue
         seen.add(candidate)
@@ -439,9 +544,10 @@ def try_download(
             break
 
         for attempt in range(max(1, retries)):
+            control.check()
             try:
                 host = urlparse(candidate).hostname or ""
-                sem = domain_limiter.acquire(host)
+                sem = None if isinstance(session, ControlledSession) else domain_limiter.acquire(host, cancel_event=control.event)
                 response: requests.Response | None = None
                 waited_s = 0.0
                 try:
@@ -469,7 +575,7 @@ def try_download(
                             )
                         )
                         domain_limiter.backoff(host, waited_s)
-                        time.sleep(waited_s)
+                        control.wait(waited_s)
                         continue
 
                     if not response.ok:
@@ -509,65 +615,53 @@ def try_download(
 
                     is_pdf_confirmed = bool(first_chunk) and is_probably_pdf(first_chunk)
                     if is_pdf_confirmed:
-                        out_file = downloads_dir / f"{prefix}.pdf"
-                        tmp_file = downloads_dir / f"{prefix}.pdf.part"
-                        try:
-                            with tmp_file.open("wb") as f:
-                                f.write(first_chunk)
-                                for chunk in chunks:
-                                    if chunk:
-                                        f.write(chunk)
-                            tmp_file.replace(out_file)
-                            if verify_title_rename:
-                                verify_downloaded_pdf_and_update_item(
-                                    item=item,
-                                    out_file=out_file,
-                                    downloads_dir=downloads_dir,
-                                    verified_dir=verified_dir,
-                                    mismatch_dir=mismatch_dir,
-                                    final_url=final_url,
-                                    candidate_url=candidate,
-                                    status_code=int(response.status_code),
-                                    content_type=(response.headers.get("content-type") or ""),
-                                    phase=phase,
-                                    logger=logger,
-                                    verify_title_threshold=float(verify_title_threshold),
-                                    verify_rename_mode=str(verify_rename_mode),
-                                    verify_weights=verify_weights,
-                                )
-                                if item.download_status == "downloaded_pdf":
-                                    return
-                                break
-
-                            item.download_status = "downloaded_pdf"
-                            item.downloaded_file = out_file.name
-                            item.note = final_url
-                            logger.add(
-                                DownloadAttempt(
-                                    phase=phase,
-                                    ref_number=item.number,
-                                    candidate_url=candidate,
-                                    final_url=final_url,
-                                    status_code=int(response.status_code),
-                                    content_type=(response.headers.get("content-type") or ""),
-                                    outcome="downloaded_pdf",
-                                    waited_seconds=0.0,
-                                    error="",
-                                )
-                            )
+                        out_file = save_pdf_stream(downloads_dir / f"{prefix}.pdf", chain([first_chunk], chunks))
+                        if out_file is None:
+                            logger.add(DownloadAttempt(
+                                phase=phase, ref_number=item.number, candidate_url=candidate,
+                                final_url=final_url, status_code=int(response.status_code),
+                                content_type=response.headers.get("content-type") or "",
+                                outcome="invalid_pdf", waited_seconds=0.0,
+                                error="PDF could not be parsed or contains no readable pages",
+                            ))
+                            break
+                        verify_downloaded_pdf_and_update_item(
+                            item=item,
+                            out_file=out_file,
+                            downloads_dir=downloads_dir,
+                            verified_dir=verified_dir,
+                            mismatch_dir=mismatch_dir,
+                            final_url=final_url,
+                            candidate_url=candidate,
+                            status_code=int(response.status_code),
+                            content_type=(response.headers.get("content-type") or ""),
+                            phase=phase,
+                            logger=logger,
+                            verify_title_threshold=float(verify_title_threshold),
+                            verify_rename_mode=str(verify_rename_mode) if verify_title_rename else "number_only",
+                            verify_weights=verify_weights,
+                            check_identity=verify_title_rename,
+                        )
+                        if item.download_status == "downloaded_pdf":
                             return
-                        finally:
-                            if tmp_file.exists():
-                                tmp_file.unlink(missing_ok=True)
+                        if item.download_status == "needs_review":
+                            best_review = deepcopy(item)
+                        break
 
                     content_type = (response.headers.get("content-type") or "")
                     best_landing_content_type = content_type
                     if "text/html" in content_type.lower():
                         host = (urlparse(final_url).hostname or "").lower()
+                        html_payload = collect_stream_text(first_chunk, chunks).encode("utf-8")
+                        response.close()
+                        response = None
+                        def verify_site_pdf(**kwargs):
+                            return verify_downloaded_pdf_and_update_item(**kwargs, check_identity=verify_title_rename)
                         helpers = {
                             "parse_retry_after_seconds": parse_retry_after_seconds,
                             "is_probably_pdf": is_probably_pdf,
-                            "verify_downloaded_pdf_and_update_item": verify_downloaded_pdf_and_update_item,
+                            "verify_downloaded_pdf_and_update_item": verify_site_pdf,
+                            "wait": control.wait,
                             "extract_springer_pdf_url": extract_springer_pdf_url,
                             "extract_chinese_journal_pdf_url": extract_chinese_journal_pdf_url,
                             "extract_ieee_arnumber": extract_ieee_arnumber,
@@ -584,18 +678,20 @@ def try_download(
                             verified_dir=verified_dir,
                             timeout=timeout,
                             attempt=attempt,
-                            verify_title_rename=verify_title_rename,
+                            verify_title_rename=True,
                             verify_title_threshold=float(verify_title_threshold),
-                            verify_rename_mode=str(verify_rename_mode),
+                            verify_rename_mode=str(verify_rename_mode) if verify_title_rename else "number_only",
                             verify_weights=verify_weights,
                             logger=logger,
                             phase=phase,
                             seen=seen,
                             prefix=prefix,
                             final_url=final_url,
-                            first_chunk=first_chunk,
-                            chunks=chunks,
+                            first_chunk=html_payload,
+                            chunks=iter(()),
                         )
+                        if item.download_status == "needs_review":
+                            best_review = deepcopy(item)
                         if handler_result == "downloaded":
                             return
                         if handler_result == "retry":
@@ -623,9 +719,12 @@ def try_download(
                     )
                 )
                 domain_limiter.backoff(urlparse(candidate).hostname or "", waited_s)
-                time.sleep(waited_s)
+                control.wait(waited_s)
                 continue
 
+    if best_review is not None:
+        item.__dict__.update(best_review.__dict__)
+        return
     if best_landing_url:
         landing_base = landing_dir or downloads_dir
         landing_file = landing_base / f"{prefix}_landing.url.txt"
@@ -676,6 +775,8 @@ def run_initial_download_phase(
     verified_dir: Path | None,
     domain_cookies: dict[str, MozillaCookieJar] | None = None,
     generic_download_sites: list[str] | None = None,
+    control: RunControl | None = None,
+    on_item_complete=None,
 ) -> None:
     """
     初次下载阶段：并发尝试每条参考文献的候选链接。
@@ -687,37 +788,26 @@ def run_initial_download_phase(
     """
     if not refs:
         return
+    control = control or RunControl()
 
     thread_local = threading.local()
     domain_limiter = DomainLimiter(max_per_domain, min_delay_ms=min_domain_delay_ms)
-    domain_cookies = domain_cookies or {}
+    session_cookies = merge_cookie_jars(cookies_jar, domain_cookies)
+    sessions = []
+    session_lock = threading.Lock()
 
-    def get_session_for_item(item: ReferenceItem) -> requests.Session:
-        """根据item的URL/DOI域名选择合适的session"""
-        # 检查item的URLs和DOIs，找到匹配的域名cookies
-        from urllib.parse import urlparse
-        for url in item.urls:
-            host = urlparse(url).hostname or ""
-            host_lower = host.lower()
-            # 检查是否有直接匹配的域名cookies
-            if host_lower in domain_cookies:
-                if not hasattr(thread_local, "domain_sessions"):
-                    thread_local.domain_sessions = {}
-                if host_lower not in thread_local.domain_sessions:
-                    thread_local.domain_sessions[host_lower] = make_session(
-                        pool_size=max(8, workers * 2),
-                        user_agent=user_agent,
-                        cookies_jar=domain_cookies[host_lower],
-                    )
-                return thread_local.domain_sessions[host_lower]
-        # 使用默认session
+    def get_session() -> requests.Session:
+        """One thread-local session; cookies remain scoped to each request host."""
         if not hasattr(thread_local, "session"):
-            thread_local.session = make_session(pool_size=max(8, workers * 2), user_agent=user_agent, cookies_jar=cookies_jar)
+            thread_local.session = make_session(pool_size=max(8, workers * 2), user_agent=user_agent,
+                cookies_jar=session_cookies, control=control, domain_limiter=domain_limiter)
+            with session_lock:
+                sessions.append(thread_local.session)
         return thread_local.session
 
     def worker(item: ReferenceItem) -> None:
-        # 根据item的域名选择合适的session
-        session = get_session_for_item(item)
+        control.check()
+        session = get_session()
         try_download(
             session=session,
             item=item,
@@ -738,442 +828,220 @@ def run_initial_download_phase(
             verify_weights=verify_weights,
             verified_dir=verified_dir,
             generic_download_sites=generic_download_sites,
+            control=control,
         )
 
+    try:
+        _run_workers(refs, worker, workers, logger, "initial", control, on_item_complete)
+    finally:
+        _close_sessions(sessions)
+
+
+def _close_sessions(sessions):
+    for session in sessions:
+        close = getattr(session, "close", None)
+        if callable(close):
+            close()
+
+
+def _run_workers(items, worker, workers, logger, phase, control, on_item_complete=None):
+    """Bound the work queue so cancellation prevents submission of later items."""
+    source = iter(items)
+    completed = 0
     with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-        futures = [executor.submit(worker, item) for item in refs]
-        iterator = as_completed(futures)
-        if show_progress and tqdm is not None:
-            iterator = tqdm(iterator, total=len(futures), desc="Initial download")
-        for _ in iterator:
-            pass
+        pending = {}
+        def submit_next():
+            if control.event.is_set():
+                return
+            item = next(source, None)
+            if item is not None:
+                original = deepcopy(item)
+                pending[executor.submit(worker, item)] = (item, original)
+        for _ in range(max(1, workers)):
+            submit_next()
+        while pending:
+            ready, _ = wait(pending, timeout=.1, return_when=FIRST_COMPLETED)
+            for future in ready:
+                item, original = pending.pop(future)
+                try:
+                    _collect_worker_result(future, item, logger, phase)
+                except RunCancelled:
+                    if item.download_status != "downloaded_pdf":
+                        item.__dict__.update(original.__dict__)
+                        item.download_status = "needs_review" if original.downloaded_file and original.download_status in {"needs_review", "downloaded_pdf"} else "not_attempted"
+                        item.note = "Stopped; retained prior files, retry this item on the next run."
+                completed += 1
+                if on_item_complete is not None:
+                    on_item_complete(item)
+                reason = f" | {item.note[:180]}" if item.download_status in {"failed", "needs_review"} else ""
+                control.emit(f"{phase}: [{item.number}] {item.download_status} ({completed}/{len(items)}){reason}")
+                submit_next()
+
+
+def _collect_worker_result(future, item: ReferenceItem, logger: DownloadLogger, phase: str) -> None:
+    try:
+        future.result()
+    except RunCancelled:
+        raise
+    except Exception as exc:
+        item.download_status = "failed"
+        item.downloaded_file = ""
+        item.note = f"{phase} worker error: {type(exc).__name__}: {exc}"
+        logger.add(DownloadAttempt(
+            phase=phase, ref_number=item.number, candidate_url="", final_url="",
+            status_code=0, content_type="", outcome="worker_exception",
+            waited_seconds=0.0, error=item.note,
+        ))
+        print(f"Reference [{item.number}] {item.note}", file=sys.stderr)
 
 
 def enrich_failed_references(
-    refs: list[ReferenceItem],
-    timeout: int,
-    lookup_timeout: int,
-    retries: int,
-    downloads_dir: Path,
-    meta_dir: Path | None,
-    landing_dir: Path | None,
-    mismatch_dir: Path | None,
-    max_items: int,
-    max_candidates_per_item: int,
-    secondary_top_k: int,
-    workers: int,
-    show_progress: bool,
-    user_agent: str,
-    max_per_domain: int,
-    min_domain_delay_ms: int,
-    logger: DownloadLogger,
-    cookies_jar: MozillaCookieJar | None,
-    verify_title_rename: bool,
-    verify_title_threshold: float,
-    verify_rename_mode: str,
-    verify_weights: VerifyWeights | dict | None,
-    verified_dir: Path | None,
-    secondary_cache: SecondaryLookupCache | None,
-    unpaywall_email: str = "",
-    generic_download_sites: list[str] | None = None,
-    api_concurrency: int = 1,
-    api_min_delay_ms: int = 500,
-    neurips_proceedings: bool = True,
+    refs: list[ReferenceItem], timeout: int, lookup_timeout: int, retries: int,
+    downloads_dir: Path, meta_dir: Path | None, landing_dir: Path | None,
+    mismatch_dir: Path | None, max_items: int, max_candidates_per_item: int,
+    secondary_top_k: int, workers: int, show_progress: bool, user_agent: str,
+    max_per_domain: int, min_domain_delay_ms: int, logger: DownloadLogger,
+    cookies_jar: MozillaCookieJar | None, verify_title_rename: bool,
+    verify_title_threshold: float, verify_rename_mode: str, verify_weights,
+    verified_dir: Path | None, secondary_cache: SecondaryLookupCache | None,
+    unpaywall_email: str = "", generic_download_sites: list[str] | None = None,
+    api_concurrency: int = 1, api_min_delay_ms: int = 500,
+    neurips_proceedings: bool = True, domain_cookies: dict[str, MozillaCookieJar] | None = None,
+    control: RunControl | None = None, on_item_complete=None, time_budget: float = 90,
 ) -> None:
-    """
-    二次检索阶段：对初次下载失败的条目调用 Crossref/OpenAlex 补全 DOI/URL，再重试下载。
-
-    说明：
-    - max_items 用于限制二次检索的数量，避免对外部 API 造成过大压力；
-    - 一旦二次下载成功，会在 note 中追加 resolved_by=secondary_lookup 标记。
-    """
-    failed = [r for r in refs if r.download_status == "failed"]
+    """Resolve and download in stages; successful main text short-circuits sources."""
+    failed = [r for r in refs if r.download_status in {"failed", "saved_landing_url", "needs_review"}]
     if max_items > 0:
         failed = failed[:max_items]
     if not failed:
         return
-
-    thread_local = threading.local()
+    control = control or RunControl()
     domain_limiter = DomainLimiter(max_per_domain, min_delay_ms=min_domain_delay_ms)
-    api_limiter = DomainLimiter(int(max(1, api_concurrency)), min_delay_ms=int(max(0, api_min_delay_ms)))
+    api_limiter = DomainLimiter(max(1, api_concurrency), min_delay_ms=max(0, api_min_delay_ms))
+    session_cookies = merge_cookie_jars(cookies_jar, domain_cookies)
+    thread_local = threading.local()
+    sessions = []
+    session_lock = threading.Lock()
 
-    def worker(item: ReferenceItem) -> None:
+    def worker(item):
+        control.check()
         if not hasattr(thread_local, "session"):
-            thread_local.session = make_session(pool_size=max(8, workers * 2), user_agent=user_agent, cookies_jar=cookies_jar)
+            thread_local.session = make_session(pool_size=max(8, workers * 2), user_agent=user_agent,
+                cookies_jar=session_cookies, control=control, domain_limiter=domain_limiter, api_limiter=api_limiter)
+            with session_lock:
+                sessions.append(thread_local.session)
         session = thread_local.session
-        cache_key = hashlib.sha1(
-            json.dumps(
-                {
-                    "v": 2,
-                    "q": guess_title_query(item.text),
-                    "y": parse_ref_year(item.text),
-                    "a": parse_first_author_surname(item.text),
-                    "k": int(secondary_top_k),
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            ).encode("utf-8")
-        ).hexdigest()
-        cached = secondary_cache.get(cache_key) if secondary_cache is not None else None
-        if cached is not None:
-            secondary_dois, secondary_urls = cached
-        else:
-            secondary_dois, secondary_urls = lookup_secondary_ranked(
-                session,
-                item=item,
-                timeout=lookup_timeout,
-                top_k=secondary_top_k,
-                api_limiter=api_limiter,
-            )
-            if secondary_cache is not None:
-                secondary_cache.set(cache_key, secondary_dois, secondary_urls)
-        item.dois = unique_preserve_order(list(item.dois) + list(secondary_dois))
-        item.urls = unique_preserve_order(list(item.urls) + list(secondary_urls))
-
-        if neurips_proceedings and is_neurips_reference(item.text):
-            expected = guess_title_query(item.text)
-            ref_year = parse_ref_year(item.text)
-            neurips_urls = lookup_neurips_proceedings_pdf_urls_by_title(
-                session,
-                expected,
-                ref_year,
-                timeout=lookup_timeout,
-            )
-            if neurips_urls:
-                item.urls = unique_preserve_order(list(neurips_urls) + list(item.urls))
-                for u in neurips_urls[:3]:
-                    logger.add(
-                        DownloadAttempt(
-                            phase="secondary",
-                            ref_number=item.number,
-                            candidate_url="neurips:search",
-                            final_url=u,
-                            status_code=0,
-                            content_type="application/pdf",
-                            outcome="neurips_injected",
-                            waited_seconds=0.0,
-                            error="",
-                        )
-                    )
-                if secondary_cache is not None:
-                    secondary_cache.set(cache_key, item.dois, item.urls)
-            else:
-                arxiv_urls = lookup_arxiv_pdf_urls_by_title(session, expected, timeout=lookup_timeout)
-                if arxiv_urls:
-                    item.urls = unique_preserve_order(list(arxiv_urls) + list(item.urls))
-                    for u in arxiv_urls[:3]:
-                        logger.add(
-                            DownloadAttempt(
-                                phase="secondary",
-                                ref_number=item.number,
-                                candidate_url="arxiv:title",
-                                final_url=u,
-                                status_code=0,
-                                content_type="application/pdf",
-                                outcome="arxiv_injected",
-                                waited_seconds=0.0,
-                                error="",
-                            )
-                        )
-                    if secondary_cache is not None:
-                        secondary_cache.set(cache_key, item.dois, item.urls)
-
-        # 尝试更多预印本服务器和开放获取来源
         expected = guess_title_query(item.text)
+        deadline = time.monotonic() + max(0.0, time_budget) if time_budget > 0 else float("inf")
+        attempted = set()
+        best_review = deepcopy(item) if item.download_status == "needs_review" else None
+        errors = []
 
-        # Semantic Scholar 开放获取 PDF
-        s2_urls = lookup_semanticscholar_pdf_urls_by_title(session, expected, timeout=lookup_timeout)
-        if s2_urls:
-            item.urls = unique_preserve_order(list(s2_urls) + list(item.urls))
-            for u in s2_urls[:2]:
-                logger.add(
-                    DownloadAttempt(
-                        phase="secondary",
-                        ref_number=item.number,
-                        candidate_url="semanticscholar:title",
-                        final_url=u,
-                        status_code=0,
-                        content_type="application/pdf",
-                        outcome="s2_injected",
-                        waited_seconds=0.0,
-                        error="",
-                    )
-                )
+        def download_candidates():
+            nonlocal best_review
+            control.check()
+            urls = [u for u in iter_candidate_urls_with_generic_sites(item, True, generic_download_sites) if u not in attempted]
+            urls = unique_preserve_order(urls)
+            if max_candidates_per_item > 0:
+                urls = urls[:max_candidates_per_item]
+            if not urls:
+                return False
+            attempted.update(urls)
+            trial = deepcopy(item)
+            trial.urls, trial.dois = urls, []
+            try_download(session=session, item=trial, downloads_dir=downloads_dir,
+                meta_dir=meta_dir, landing_dir=landing_dir, mismatch_dir=mismatch_dir,
+                timeout=timeout, retries=retries, use_doi=False,
+                max_candidates_per_item=max_candidates_per_item, domain_limiter=domain_limiter,
+                logger=logger, phase="secondary", verify_title_rename=verify_title_rename,
+                verify_title_threshold=verify_title_threshold, verify_rename_mode=verify_rename_mode,
+                verify_weights=verify_weights, verified_dir=verified_dir, control=control)
+            if trial.download_status == "needs_review":
+                best_review = trial
+            if trial.download_status == "downloaded_pdf":
+                item.download_status, item.downloaded_file, item.note = trial.download_status, trial.downloaded_file, trial.note
+                item.document_kind, item.verification_reason, item.verification_version = trial.document_kind, trial.verification_reason, trial.verification_version
+                item.identity_checked = trial.identity_checked
+                item.note += " | resolved_by=secondary_lookup"
+                return True
+            if trial.download_status == "saved_landing_url" and item.download_status != "needs_review":
+                item.download_status, item.downloaded_file, item.note = trial.download_status, trial.downloaded_file, trial.note
+            return False
 
-        # Europe PMC 开放获取
-        pmc_urls = lookup_europepmc_pdf_urls_by_title(session, expected, timeout=lookup_timeout)
-        if pmc_urls:
-            item.urls = unique_preserve_order(list(pmc_urls) + list(item.urls))
-            for u in pmc_urls[:2]:
-                logger.add(
-                    DownloadAttempt(
-                        phase="secondary",
-                        ref_number=item.number,
-                        candidate_url="europepmc:title",
-                        final_url=u,
-                        status_code=0,
-                        content_type="application/pdf",
-                        outcome="pmc_injected",
-                        waited_seconds=0.0,
-                        error="",
-                    )
-                )
+        def ranked():
+            return lookup_secondary_ranked(session, item=item, timeout=lookup_timeout,
+                top_k=secondary_top_k, api_limiter=None if isinstance(session, ControlledSession) else api_limiter)
 
-        # bioRxiv/medRxiv 预印本
-        biorxiv_urls = lookup_biorxiv_pdf_urls_by_title(session, expected, timeout=lookup_timeout)
-        if biorxiv_urls:
-            item.urls = unique_preserve_order(list(biorxiv_urls) + list(item.urls))
-            for u in biorxiv_urls[:2]:
-                logger.add(
-                    DownloadAttempt(
-                        phase="secondary",
-                        ref_number=item.number,
-                        candidate_url="biorxiv:title",
-                        final_url=u,
-                        status_code=0,
-                        content_type="application/pdf",
-                        outcome="biorxiv_injected",
-                        waited_seconds=0.0,
-                        error="",
-                    )
-                )
-
-        # CORE 开放获取
-        core_urls = lookup_core_pdf_urls_by_title(session, expected, timeout=lookup_timeout)
-        if core_urls:
-            item.urls = unique_preserve_order(list(core_urls) + list(item.urls))
-            for u in core_urls[:2]:
-                logger.add(
-                    DownloadAttempt(
-                        phase="secondary",
-                        ref_number=item.number,
-                        candidate_url="core:title",
-                        final_url=u,
-                        status_code=0,
-                        content_type="application/pdf",
-                        outcome="core_injected",
-                        waited_seconds=0.0,
-                        error="",
-                    )
-                )
-
-        # OpenAlex 开放获取
-        openalex_urls = lookup_openalex_pdf_urls_by_title(session, expected, timeout=lookup_timeout)
-        if openalex_urls:
-            item.urls = unique_preserve_order(list(openalex_urls) + list(item.urls))
-            for u in openalex_urls[:2]:
-                logger.add(
-                    DownloadAttempt(
-                        phase="secondary",
-                        ref_number=item.number,
-                        candidate_url="openalex:title",
-                        final_url=u,
-                        status_code=0,
-                        content_type="application/pdf",
-                        outcome="openalex_injected",
-                        waited_seconds=0.0,
-                        error="",
-                    )
-                )
-
-        # Crossref TDM API
-        crossref_tdm_urls = lookup_crossref_tdm_urls(session, expected, timeout=lookup_timeout)
-        if crossref_tdm_urls:
-            item.urls = unique_preserve_order(list(crossref_tdm_urls) + list(item.urls))
-            for u in crossref_tdm_urls[:2]:
-                logger.add(
-                    DownloadAttempt(
-                        phase="secondary",
-                        ref_number=item.number,
-                        candidate_url="crossref_tdm:title",
-                        final_url=u,
-                        status_code=0,
-                        content_type="application/pdf",
-                        outcome="crossref_tdm_injected",
-                        waited_seconds=0.0,
-                        error="",
-                    )
-                )
-
-        # Google Books（用于书籍）
-        gbooks_urls = lookup_google_books_pdf_urls(session, expected, timeout=lookup_timeout)
-        if gbooks_urls:
-            item.urls = unique_preserve_order(list(gbooks_urls) + list(item.urls))
-            for u in gbooks_urls[:2]:
-                logger.add(
-                    DownloadAttempt(
-                        phase="secondary",
-                        ref_number=item.number,
-                        candidate_url="googlebooks:title",
-                        final_url=u,
-                        status_code=0,
-                        content_type="application/pdf",
-                        outcome="gbooks_injected",
-                        waited_seconds=0.0,
-                        error="",
-                    )
-                )
-
-        # SSRN 预印本
-        ssrn_urls = lookup_ssrn_pdf_urls_by_title(session, expected, timeout=lookup_timeout)
-        if ssrn_urls:
-            item.urls = unique_preserve_order(list(ssrn_urls) + list(item.urls))
-            for u in ssrn_urls[:2]:
-                logger.add(
-                    DownloadAttempt(
-                        phase="secondary",
-                        ref_number=item.number,
-                        candidate_url="ssrn:title",
-                        final_url=u,
-                        status_code=0,
-                        content_type="application/pdf",
-                        outcome="ssrn_injected",
-                        waited_seconds=0.0,
-                        error="",
-                    )
-                )
-
-        # ChemRxiv 预印本
-        chemrxiv_urls = lookup_chemrxiv_pdf_urls_by_title(session, expected, timeout=lookup_timeout)
-        if chemrxiv_urls:
-            item.urls = unique_preserve_order(list(chemrxiv_urls) + list(item.urls))
-            for u in chemrxiv_urls[:2]:
-                logger.add(
-                    DownloadAttempt(
-                        phase="secondary",
-                        ref_number=item.number,
-                        candidate_url="chemrxiv:title",
-                        final_url=u,
-                        status_code=0,
-                        content_type="application/pdf",
-                        outcome="chemrxiv_injected",
-                        waited_seconds=0.0,
-                        error="",
-                    )
-                )
-
-        # ResearchGate（补充来源）
-        rg_urls = lookup_researchgate_pdf_urls_by_title(session, expected, timeout=lookup_timeout)
-        if rg_urls:
-            item.urls = unique_preserve_order(list(rg_urls) + list(item.urls))
-            for u in rg_urls[:2]:
-                logger.add(
-                    DownloadAttempt(
-                        phase="secondary",
-                        ref_number=item.number,
-                        candidate_url="researchgate:title",
-                        final_url=u,
-                        status_code=0,
-                        content_type="application/pdf",
-                        outcome="researchgate_injected",
-                        waited_seconds=0.0,
-                        error="",
-                    )
-                )
-
-        # 尝试Unpaywall获取开放获取PDF，并记录可观测事件
+        sources = [("metadata", ranked)]
+        if neurips_proceedings and is_neurips_reference(item.text):
+            sources.insert(0, ("neurips", lambda: ([], lookup_neurips_proceedings_pdf_urls_by_title(
+                session, expected, parse_ref_year(item.text), timeout=lookup_timeout))))
         if unpaywall_email:
-            for doi in item.dois:
-                oa_url = lookup_unpaywall(session, doi, email=unpaywall_email, timeout=lookup_timeout)
-                api_url = f"https://api.unpaywall.org/v2/{quote(doi, safe='')}"
-                if oa_url:
-                    logger.add(
-                        DownloadAttempt(
-                            phase="secondary",
-                            ref_number=item.number,
-                            candidate_url=api_url,
-                            final_url=oa_url,
-                            status_code=0,
-                            content_type="",
-                            outcome="unpaywall_candidate",
-                            waited_seconds=0.0,
-                            error="",
-                        )
-                    )
-                    if oa_url not in item.urls:
-                        item.urls = unique_preserve_order(list(item.urls) + [oa_url])
-                        logger.add(
-                            DownloadAttempt(
-                                phase="secondary",
-                                ref_number=item.number,
-                                candidate_url=oa_url,
-                                final_url="",
-                                status_code=0,
-                                content_type="",
-                                outcome="unpaywall_injected",
-                                waited_seconds=0.0,
-                                error="",
-                            )
-                        )
-                else:
-                    logger.add(
-                        DownloadAttempt(
-                            phase="secondary",
-                            ref_number=item.number,
-                            candidate_url=api_url,
-                            final_url="",
-                            status_code=0,
-                            content_type="",
-                            outcome="unpaywall_miss",
-                            waited_seconds=0.0,
-                            error="",
-                        )
-                    )
+            sources.append(("unpaywall", lambda: ([], unique_preserve_order(
+                [u for d in item.dois if (u := lookup_unpaywall(session, d, email=unpaywall_email, timeout=lookup_timeout))]
+                if item.dois else lookup_unpaywall_by_title(session, expected, email=unpaywall_email, timeout=lookup_timeout)))))
+        for label, fn in [("openalex", lookup_openalex_pdf_urls_by_title),
+                          ("semanticscholar", lookup_semanticscholar_pdf_urls_by_title),
+                          ("arxiv", lookup_arxiv_pdf_urls_by_title),
+                          ("core", lookup_core_pdf_urls_by_title),
+                          ("crossref_tdm", lookup_crossref_tdm_urls)]:
+            sources.append((label, lambda fn=fn: ([], fn(session, expected, timeout=lookup_timeout))))
+        text = item.text.lower()
+        if re.search(r"biolog|biomed|clinical|biorxiv|medrxiv|pubmed|medicine", text):
+            for label, fn in [("europepmc", lookup_europepmc_pdf_urls_by_title), ("biorxiv", lookup_biorxiv_pdf_urls_by_title)]:
+                sources.append((label, lambda fn=fn: ([], fn(session, expected, timeout=lookup_timeout))))
+        if re.search(r"chemrxiv|chemistry|chemical", text):
+            sources.append(("chemrxiv", lambda: ([], lookup_chemrxiv_pdf_urls_by_title(session, expected, timeout=lookup_timeout))))
+        if re.search(r"ssrn|economic|finance|business", text):
+            sources.append(("ssrn", lambda: ([], lookup_ssrn_pdf_urls_by_title(session, expected, timeout=lookup_timeout))))
+        if re.search(r"isbn|textbook|\bbook\b|\bedition\b", text):
+            sources.append(("googlebooks", lambda: ([], lookup_google_books_pdf_urls(session, expected, timeout=lookup_timeout))))
+        sources.append(("researchgate", lambda: ([], lookup_researchgate_pdf_urls_by_title(session, expected, timeout=lookup_timeout))))
 
-            # 如果没有 DOI，尝试通过标题搜索 Unpaywall
-            if not item.dois and expected:
-                unpaywall_title_urls = lookup_unpaywall_by_title(session, expected, email=unpaywall_email, timeout=lookup_timeout)
-                if unpaywall_title_urls:
-                    item.urls = unique_preserve_order(list(unpaywall_title_urls) + list(item.urls))
-                    for u in unpaywall_title_urls[:2]:
-                        logger.add(
-                            DownloadAttempt(
-                                phase="secondary",
-                                ref_number=item.number,
-                                candidate_url="unpaywall:title",
-                                final_url=u,
-                                status_code=0,
-                                content_type="application/pdf",
-                                outcome="unpaywall_title_injected",
-                                waited_seconds=0.0,
-                                error="",
-                            )
-                        )
+        for label, lookup in sources:
+            control.check()
+            if time.monotonic() >= deadline:
+                errors.append("lookup time budget reached")
+                break
+            key = hashlib.sha256(json.dumps({"v":4,"source":label,"title":expected,
+                "text":item.text,"k":secondary_top_k,"email":unpaywall_email,
+                "doi":sorted(item.dois) if label=="unpaywall" else []}, sort_keys=True).encode()).hexdigest()
+            cached = secondary_cache.get(key) if secondary_cache is not None else None
+            before = getattr(session, "transient_errors", 0)
+            try:
+                result = cached if cached is not None else lookup()
+                control.check()
+                dois, urls = result
+                after = getattr(session, "transient_errors", 0)
+                transient = isinstance(before, int) and isinstance(after, int) and after > before
+                if secondary_cache is not None and cached is None and not transient:
+                    secondary_cache.set(key, dois, urls)
+                item.dois = unique_preserve_order(list(dois) + item.dois)
+                item.urls = unique_preserve_order(list(urls) + item.urls)
+                logger.add(DownloadAttempt("secondary", item.number, label, "", 0, "",
+                    "cache_hit" if cached is not None else "lookup_found" if dois or urls else "lookup_transient" if transient else "lookup_miss", 0.0, ""))
+            except RunCancelled:
+                raise
+            except Exception as exc:
+                errors.append(f"{label}: {type(exc).__name__}: {exc}")
+                logger.add(DownloadAttempt("secondary", item.number, label, "", 0, "", "lookup_exception", 0.0, errors[-1]))
+                continue
+            if download_candidates():
+                return
+        if best_review is not None:
+            # Keep all discovered candidates, not just the trial's subset.
+            item.download_status, item.downloaded_file, item.note = best_review.download_status, best_review.downloaded_file, best_review.note
+            item.document_kind, item.verification_reason, item.verification_version = best_review.document_kind, best_review.verification_reason, best_review.verification_version
+            item.identity_checked = best_review.identity_checked
+        if errors:
+            item.note = (item.note + " | " + "; ".join(errors)).strip(" |")
 
-        if item.dois or item.urls:
-            try_download(
-                session=session,
-                item=item,
-                downloads_dir=downloads_dir,
-                meta_dir=meta_dir,
-                landing_dir=landing_dir,
-                mismatch_dir=mismatch_dir,
-                timeout=timeout,
-                retries=retries,
-                use_doi=True,
-                max_candidates_per_item=max_candidates_per_item,
-                domain_limiter=domain_limiter,
-                logger=logger,
-                phase="secondary",
-                verify_title_rename=verify_title_rename,
-                verify_title_threshold=verify_title_threshold,
-                verify_rename_mode=verify_rename_mode,
-                verify_weights=verify_weights,
-                verified_dir=verified_dir,
-                generic_download_sites=generic_download_sites,
-            )
-            if item.download_status != "failed":
-                item.note = f"{item.note} | resolved_by=secondary_lookup".strip()
-
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-        futures = [executor.submit(worker, item) for item in failed]
-        iterator = as_completed(futures)
-        if show_progress and tqdm is not None:
-            iterator = tqdm(iterator, total=len(futures), desc="Secondary lookup")
-        for _ in iterator:
-            pass
-    if secondary_cache is not None:
-        secondary_cache.flush()
+    try:
+        _run_workers(failed, worker, workers, logger, "secondary", control, on_item_complete)
+    finally:
+        _close_sessions(sessions)
+        if secondary_cache is not None:
+            secondary_cache.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -1607,6 +1475,8 @@ def run_pipeline_from_refs(
     cfg: PipelineConfig,
     *,
     verify_weights: VerifyWeights | None = None,
+    cancel_event: threading.Event | None = None,
+    progress_callback=None,
 ) -> list[ReferenceItem]:
     """Run download pipeline from pre-parsed reference items.
 
@@ -1619,6 +1489,8 @@ def run_pipeline_from_refs(
     """
     from site_handlers.domain_analyzer import analyze_reference_domains
     from src.interactive_ui import should_run_interactive, display_domain_summary, configure_cookies_interactively
+    control = RunControl(cancel_event, progress_callback)
+    control.check()
 
     if verify_weights is None:
         verify_weights = VerifyWeights()
@@ -1646,14 +1518,17 @@ def run_pipeline_from_refs(
         domain_cookies_config = load_domain_cookies_config(domain_cookies_file_path)
 
     domain_info = analyze_reference_domains(refs, domain_cookies_config)
-    display_domain_summary(domain_info)
+    if progress_callback is None:
+        display_domain_summary(domain_info)
+    else:
+        control.emit(f"Parsed {len(refs)} references; {len(domain_info)} source domains.")
 
     is_interactive = should_run_interactive(cfg.interactive)
     if is_interactive:
         new_config = configure_cookies_interactively(domain_info, domain_cookies_config)
         if new_config != domain_cookies_config:
             domain_cookies_config = new_config
-            domain_cookies_config = save_domain_cookies_config(domain_cookies_config, domain_cookies_file_path)
+            save_domain_cookies_config(domain_cookies_config, domain_cookies_file_path)
             print(f"\n已保存域名cookies配置到: {domain_cookies_file_path}")
 
     domain_cookies = load_domain_cookies(domain_cookies_config, Path.cwd())
@@ -1664,9 +1539,19 @@ def run_pipeline_from_refs(
     if cfg.resume:
         apply_resume_state(refs, output_dir=cfg.output_dir, downloads_dir=downloads_dir)
 
+    snapshots = deepcopy(refs)
+    positions = {id(item): i for i, item in enumerate(refs)}
+    hash_cache = {}
+    def checkpoint(item):
+        snapshots[positions[id(item)]] = deepcopy(item)
+        write_outputs(snapshots, cfg.output_dir, hash_cache=hash_cache)
+        if cfg.download_log:
+            logger.write_csv(cfg.output_dir / cfg.download_log)
+
     # Download phases
     if not cfg.no_download:
         logger = DownloadLogger()
+        write_outputs(snapshots, cfg.output_dir, hash_cache=hash_cache)
         secondary_cache: SecondaryLookupCache | None = None
         cache_str = cfg.secondary_cache.strip()
         if cache_str:
@@ -1699,8 +1584,10 @@ def run_pipeline_from_refs(
             verified_dir=verified_dir,
             domain_cookies=domain_cookies,
             generic_download_sites=sites,
+            control=control,
+            on_item_complete=checkpoint,
         )
-        if cfg.secondary_lookup:
+        if cfg.secondary_lookup and not control.event.is_set():
             enrich_failed_references(
                 initial_refs,
                 timeout=cfg.timeout,
@@ -1720,6 +1607,7 @@ def run_pipeline_from_refs(
                 min_domain_delay_ms=cfg.min_domain_delay_ms,
                 logger=logger,
                 cookies_jar=cookies_jar,
+                domain_cookies=domain_cookies,
                 verify_title_rename=cfg.verify_title_rename,
                 verify_title_threshold=cfg.verify_title_threshold,
                 verify_rename_mode=cfg.verify_rename_mode,
@@ -1731,6 +1619,8 @@ def run_pipeline_from_refs(
                 api_concurrency=cfg.api_concurrency,
                 api_min_delay_ms=cfg.api_min_delay_ms,
                 neurips_proceedings=cfg.neurips_proceedings,
+                control=control,
+                on_item_complete=checkpoint,
             )
         if cfg.download_log:
             logger.write_csv(cfg.output_dir / cfg.download_log)
@@ -1743,9 +1633,10 @@ def run_pipeline_from_refs(
     ok_pdf = sum(1 for r in refs if r.download_status == "downloaded_pdf")
     ok_landing = sum(1 for r in refs if r.download_status == "saved_landing_url")
     failed = sum(1 for r in refs if r.download_status == "failed")
-    print(f"Done. Parsed {total} references.")
-    print(f"PDF downloaded: {ok_pdf}, landing URLs saved: {ok_landing}, failed: {failed}")
-    print(f"Output directory: {cfg.output_dir.resolve()}")
+    review = sum(1 for r in refs if r.download_status == "needs_review")
+    control.emit(f"{'Stopped' if control.event.is_set() else 'Done'}. Parsed {total} references.")
+    control.emit(f"PDF downloaded: {ok_pdf}, review: {review}, landing URLs saved: {ok_landing}, failed: {failed}")
+    control.emit(f"Output directory: {cfg.output_dir.resolve()}")
 
     if failed > 0:
         suggest_cookies_configuration(refs, domain_cookies_config, cfg.output_dir)
@@ -1757,6 +1648,8 @@ def run_pipeline(
     cfg: PipelineConfig,
     *,
     verify_weights: VerifyWeights | None = None,
+    cancel_event: threading.Event | None = None,
+    progress_callback=None,
 ) -> list[ReferenceItem]:
     """Run the full reference extraction and download pipeline from a PDF.
 
@@ -1767,6 +1660,8 @@ def run_pipeline(
     Returns the list of reference items with download status populated.
     """
     # Validate PDF input
+    control = RunControl(cancel_event, progress_callback)
+    control.check()
     if not cfg.input_pdf.exists():
         raise FileNotFoundError(f"Input PDF does not exist: {cfg.input_pdf}")
     if not cfg.input_pdf.is_file():
@@ -1788,5 +1683,6 @@ def run_pipeline(
     # Extract and parse references
     ref_section = extract_references_section(full_text)
     refs = split_references(ref_section)
-
-    return run_pipeline_from_refs(refs, cfg, verify_weights=verify_weights)
+    control.check()
+    return run_pipeline_from_refs(refs, cfg, verify_weights=verify_weights,
+        cancel_event=control.event, progress_callback=progress_callback)

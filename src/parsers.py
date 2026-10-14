@@ -100,8 +100,24 @@ def cleanup_reference_text(text: str) -> str:
     """
     text = text.replace("‘", "'").replace("’", "'")
     text = text.replace("“", '"').replace("”", '"')
+    # Protect identifier tokens before dehyphenating ordinary prose. A hyphen
+    # in a DOI/URL is meaningful, even if the PDF wraps immediately after it.
+    protected: list[str] = []
+    def protect(match: re.Match) -> str:
+        token = match.group(0)
+        token = re.sub(r"[ \t]*\r?\n[ \t]*", "", token)
+        protected.append(token)
+        return f"\x00IDENTIFIER{len(protected) - 1}\x00"
+    text = re.sub(
+        r"(?:https?://|10\.\d{4,9}/)(?:[ \t]*\r?\n[ \t]*)?"
+        r"(?:[^\s\]]*[-/_?=&][ \t]*\r?\n[ \t]*)*[^\s\]]+",
+        protect, text,
+    )
     text = re.sub(r"-\s*\n\s*", "", text)
     text = re.sub(r"\s*\n\s*", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    for index, token in enumerate(protected):
+        text = text.replace(f"\x00IDENTIFIER{index}\x00", token)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 

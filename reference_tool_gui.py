@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import contextlib
-import io
 import json
 import importlib.util
 import os
@@ -20,11 +18,15 @@ from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from core.verify import verify_and_rename_pdf
+from core.document import VERIFICATION_VERSION
+from core.pdf_files import contained_file, atomic_write_text
+from src.parsers import DOI_RE
 from src.lookup import guess_title_query, parse_first_author_surname, parse_ref_year
 from src.downloader import load_config_file, run_pipeline
 from src.models import ReferenceItem, PipelineConfig
+from core.runtime import RunCancelled
 
-STATUS_ORDER = ["downloaded_pdf", "saved_landing_url", "failed", "not_attempted"]
+STATUS_ORDER = ["downloaded_pdf", "needs_review", "saved_landing_url", "failed", "not_attempted"]
 
 I18N = {
     "zh": {
@@ -65,6 +67,8 @@ I18N = {
         "ready": "就绪",
         "finished": "已完成",
         "stopped": "已停止",
+        "stopping": "正在停止，保存已完成结果...",
+        "error": "运行出错",
         "invalid": "参数错误",
         "save_btn": "保存",
         "cancel_btn": "取消",
@@ -133,6 +137,8 @@ I18N = {
         "ready": "Ready",
         "finished": "Finished",
         "stopped": "Stopped",
+        "stopping": "Stopping; saving completed results...",
+        "error": "Run failed",
         "invalid": "Invalid settings",
         "save_btn": "Save",
         "cancel_btn": "Cancel",
@@ -444,7 +450,7 @@ def run_rename_only_on_output(
     downloads_dir = output_dir / "downloads"
     verified_dir = downloads_dir / verified_subdir
     mismatch_dir = downloads_dir / mismatch_subdir
-    stats = {"processed": 0, "renamed_ok": 0, "mismatch": 0, "skipped": 0}
+    stats = {"processed": 0, "renamed_ok": 0, "mismatch": 0, "skipped": 0, "needs_review": 0}
 
     for row in rows:
         if not isinstance(row, dict):
@@ -457,8 +463,8 @@ def run_rename_only_on_output(
         if not rel:
             stats["skipped"] += 1
             continue
-        out_file = downloads_dir / rel
-        if not out_file.exists() or not out_file.is_file() or out_file.suffix.lower() != ".pdf":
+        out_file = contained_file(downloads_dir, rel)
+        if out_file is None or out_file.suffix.lower() != ".pdf":
             stats["skipped"] += 1
             continue
         try:
@@ -481,20 +487,31 @@ def run_rename_only_on_output(
             verify_title_threshold=float(verify_threshold),
             verify_weights=None,
             verify_rename_mode=str(rename_mode or "number_and_original"),
+            expected_dois=DOI_RE.findall(ref_text),
+            expected_kind="presentation" if any(w in ref_text.lower() for w in ["keynote", "tutorial", "presentation", "lecture"]) else "",
         )
+        row["document_kind"] = decision.document_kind
+        row["verification_reason"] = decision.reason
+        row["verification_version"] = VERIFICATION_VERSION
+        row["identity_checked"] = True
         stats["processed"] += 1
         if decision.outcome == "downloaded_pdf":
             row["download_status"] = "downloaded_pdf"
             row["downloaded_file"] = decision.rel_path
             row["note"] = f"{str(row.get('note') or '').strip()} | rename_only_ok".strip(" |")
             stats["renamed_ok"] += 1
+        elif decision.outcome == "needs_review":
+            row["download_status"] = "needs_review"
+            row["downloaded_file"] = decision.rel_path
+            row["note"] = decision.reason
+            stats["needs_review"] += 1
         else:
             row["download_status"] = "failed"
             row["downloaded_file"] = decision.rel_path
             row["note"] = f"{str(row.get('note') or '').strip()} | rename_only_mismatch".strip(" |")
             stats["mismatch"] += 1
 
-    refs_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(refs_path, json.dumps(rows, ensure_ascii=False, indent=2))
     return stats
 
 
@@ -1153,17 +1170,14 @@ class ReferenceToolGUI:
                 neurips_proceedings=str(gui_cfg.get("neurips_proceedings", "true")).lower() == "true",
                 show_progress=False,
             )
-            f = io.StringIO()
-            with contextlib.redirect_stdout(f):
-                run_pipeline(cfg)
-            output = f.getvalue()
-            for line in output.splitlines(keepends=True):
-                self.log_queue.put(line)
+            run_pipeline(cfg, cancel_event=self._stop_requested, progress_callback=self.log_queue.put)
+        except RunCancelled:
+            self.log_queue.put("__EXIT__:130")
         except Exception as exc:
             self.log_queue.put(f"Error: {exc}\n")
             self.log_queue.put("__EXIT__:1")
         else:
-            self.log_queue.put("__EXIT__:0")
+            self.log_queue.put("__EXIT__:130" if self._stop_requested.is_set() else "__EXIT__:0")
 
     def _rename_only(self) -> None:
         try:
@@ -1188,6 +1202,8 @@ class ReferenceToolGUI:
         if self._pipeline_thread is None or not self._pipeline_thread.is_alive():
             return
         self._stop_requested.set()
+        self.stop_btn.state(["disabled"])
+        self._set_status("stopping")
 
     def _append_log(self, text: str) -> None:
         self.log_text.configure(state=tk.NORMAL)
@@ -1203,6 +1219,8 @@ class ReferenceToolGUI:
                     self._on_finished(int(line.split(":", 1)[1]))
                 else:
                     self._append_log(line)
+                    if line.startswith(("initial:", "secondary:")):
+                        self._refresh_summary()
         except queue.Empty:
             pass
         self.root.after(120, self._pump_logs)
@@ -1212,7 +1230,7 @@ class ReferenceToolGUI:
         self.run_btn.state(["!disabled"])
         self.stop_btn.state(["disabled"])
         self._pipeline_thread = None
-        self._set_status("finished" if code == 0 else "stopped")
+        self._set_status("finished" if code == 0 else "stopped" if code == 130 else "error")
         self._refresh_summary()
 
     def _save_config(self) -> None:
@@ -1274,6 +1292,7 @@ class ReferenceToolGUI:
             f"output: {out}",
             f"total: {summary['total']}",
             f"downloaded_pdf: {summary['downloaded_pdf']}",
+            f"needs_review: {summary['needs_review']}",
             f"saved_landing_url: {summary['saved_landing_url']}",
             f"failed: {summary['failed']}",
             f"not_attempted: {summary['not_attempted']}",

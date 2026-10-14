@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 import os
 import sys
@@ -10,6 +11,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from core.pdf_files import atomic_write_text
 
 
 _DEBUG = os.environ.get("REFERENCE_DEBUG") or os.environ.get("DEBUG")
@@ -34,6 +36,10 @@ class ReferenceItem:
     download_status: str = "not_attempted"
     downloaded_file: str = ""
     note: str = ""
+    document_kind: str = ""
+    verification_reason: str = ""
+    verification_version: int = 0
+    identity_checked: bool = False
 
 
 @dataclass
@@ -73,7 +79,7 @@ class DownloadLogger:
         if not rows:
             return
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        with file_path.open("w", newline="", encoding="utf-8-sig") as f:
+        with io.StringIO(newline="") as f:
             writer = csv.DictWriter(
                 f,
                 fieldnames=[
@@ -85,18 +91,23 @@ class DownloadLogger:
             writer.writeheader()
             for row in rows:
                 writer.writerow(asdict(row))
+            atomic_write_text(file_path, "\ufeff" + f.getvalue())
 
 
 class SecondaryLookupCache:
     """Thread-safe JSON file cache for secondary lookup results."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, positive_ttl: float = 604800, negative_ttl: float = 900, clock=None) -> None:
         self._path = path
+        self._clock = clock or time.time
+        self._positive_ttl = max(0.0, positive_ttl)
+        self._negative_ttl = max(0.0, negative_ttl)
         self._lock = threading.Lock()
         self._data: dict[str, dict] = {}
         if self._path.exists():
             try:
-                self._data = json.loads(self._path.read_text(encoding="utf-8")) or {}
+                data = json.loads(self._path.read_text(encoding="utf-8"))
+                self._data = data if isinstance(data, dict) else {}
             except Exception:
                 if _DEBUG:
                     print(f"[DEBUG models] SecondaryLookupCache failed to load {self._path}", file=sys.stderr)
@@ -111,23 +122,21 @@ class SecondaryLookupCache:
         urls = row.get("urls")
         if not isinstance(dois, list) or not isinstance(urls, list):
             return None
-        if not dois and not urls:
+        ttl = self._positive_ttl if dois or urls else self._negative_ttl
+        timestamp = row.get("ts")
+        if not isinstance(timestamp, (int, float)) or not 0 <= self._clock() - timestamp < ttl:
             return None
         return [str(x) for x in dois], [str(x) for x in urls]
 
     def set(self, key: str, dois: list[str], urls: list[str]) -> None:
-        if not dois and not urls:
-            return
         with self._lock:
-            self._data[key] = {"ts": time.time(), "dois": list(dois), "urls": list(urls)}
+            self._data[key] = {"ts": self._clock(), "dois": list(dois), "urls": list(urls)}
 
     def flush(self) -> None:
         with self._lock:
             data = dict(self._data)
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        atomic_write_text(self._path, json.dumps(data, ensure_ascii=False, indent=2))
 
 
 class DomainLimiter:
@@ -169,7 +178,8 @@ class DomainLimiter:
             backoff_until = self._backoff_until.get(key, 0.0)
         return max(0.0, max(next_allowed, backoff_until) - t)
 
-    def acquire(self, host: str) -> threading.Semaphore | None:
+    def acquire(self, host: str, cancel_event: threading.Event | None = None) -> threading.Semaphore | None:
+        from core.runtime import RunCancelled
         key = (host or "").lower()
         if not key:
             return None
@@ -182,7 +192,12 @@ class DomainLimiter:
                 if sem is None:
                     sem = threading.Semaphore(self._max_per_domain)
                     self._semaphores[key] = sem
-            sem.acquire()
+            if cancel_event is None:
+                sem.acquire()
+            else:
+                while not sem.acquire(timeout=0.1):
+                    if cancel_event.is_set():
+                        raise RunCancelled()
         now = time.monotonic()
         with self._lock:
             next_allowed = self._next_allowed.get(key, 0.0)
@@ -191,8 +206,16 @@ class DomainLimiter:
             base = max(next_allowed, backoff_until, now)
             if self._min_delay_s > 0:
                 self._next_allowed[key] = base + self._min_delay_s
+        if cancel_event is not None and cancel_event.is_set():
+            self.release(sem)
+            raise RunCancelled()
         if wait_s > 0:
-            time.sleep(wait_s)
+            if cancel_event is not None:
+                if cancel_event.wait(wait_s):
+                    self.release(sem)
+                    raise RunCancelled()
+            else:
+                time.sleep(wait_s)
         return sem
 
     def release(self, sem: threading.Semaphore | None) -> None:
@@ -241,7 +264,7 @@ class PipelineConfig:
     secondary_lookup: bool = False
     secondary_max: int = 40
     secondary_top_k: int = 2
-    secondary_cache: str = ""
+    secondary_cache: str = "cache/secondary_lookup_cache.json"
     neurips_proceedings: bool = True
 
     # Verification

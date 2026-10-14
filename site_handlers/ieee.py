@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from typing import Iterable
+from itertools import chain
 
 import requests
 
 from core import collect_stream_text
+from core.pdf_files import save_pdf_stream
 from .registry import HandlerResult, register
 
 
@@ -75,7 +77,7 @@ def handle_ieee_html(
                         error="",
                     )
                 )
-                _time.sleep(waited_s)
+                helpers.get("wait", _time.sleep)(waited_s)
                 return "retry"
             if not pdf_response.ok:
                 logger.add(
@@ -101,54 +103,45 @@ def handle_ieee_html(
                     pdf_first_chunk = chunk
                     break
             if pdf_first_chunk and is_probably_pdf(pdf_first_chunk):
-                out_file = downloads_dir / f"{prefix}.pdf"
-                tmp_file = downloads_dir / f"{prefix}.pdf.part"
-                try:
-                    with tmp_file.open("wb") as f:
-                        f.write(pdf_first_chunk)
-                        for chunk in pdf_chunks:
-                            if chunk:
-                                f.write(chunk)
-                    tmp_file.replace(out_file)
-                    if verify_title_rename:
-                        handled = verify_downloaded_pdf_and_update_item(
-                            item=item,
-                            out_file=out_file,
-                            downloads_dir=downloads_dir,
-                            verified_dir=verified_dir,
-                            mismatch_dir=mismatch_dir,
-                            final_url=stamp_final_url,
-                            candidate_url=stamp_url,
-                            status_code=int(pdf_response.status_code),
-                            content_type=(pdf_response.headers.get("content-type") or ""),
-                            phase=phase,
-                            logger=logger,
-                            verify_title_threshold=float(verify_title_threshold),
-                            verify_rename_mode=str(verify_rename_mode or "number_and_original"),
-                            verify_weights=verify_weights,
-                        )
-                        return "downloaded" if item.download_status == "downloaded_pdf" else "continue"
-
-                    item.download_status = "downloaded_pdf"
-                    item.downloaded_file = out_file.name
-                    item.note = stamp_final_url
-                    logger.add(
-                        DownloadAttempt(
-                            phase=phase,
-                            ref_number=item.number,
-                            candidate_url=stamp_url,
-                            final_url=stamp_final_url,
-                            status_code=int(pdf_response.status_code),
-                            content_type=(pdf_response.headers.get("content-type") or ""),
-                            outcome="downloaded_pdf",
-                            waited_seconds=0.0,
-                            error="",
-                        )
+                out_file = save_pdf_stream(downloads_dir / f"{prefix}.pdf", chain([pdf_first_chunk], pdf_chunks))
+                if out_file is None:
+                    return "continue"
+                if verify_title_rename:
+                    handled = verify_downloaded_pdf_and_update_item(
+                        item=item,
+                        out_file=out_file,
+                        downloads_dir=downloads_dir,
+                        verified_dir=verified_dir,
+                        mismatch_dir=mismatch_dir,
+                        final_url=stamp_final_url,
+                        candidate_url=stamp_url,
+                        status_code=int(pdf_response.status_code),
+                        content_type=(pdf_response.headers.get("content-type") or ""),
+                        phase=phase,
+                        logger=logger,
+                        verify_title_threshold=float(verify_title_threshold),
+                        verify_rename_mode=str(verify_rename_mode or "number_and_original"),
+                        verify_weights=verify_weights,
                     )
-                    return "downloaded"
-                finally:
-                    if tmp_file.exists():
-                        tmp_file.unlink(missing_ok=True)
+                    return "downloaded" if item.download_status == "downloaded_pdf" else "continue"
+
+                item.download_status = "downloaded_pdf"
+                item.downloaded_file = out_file.name
+                item.note = stamp_final_url
+                logger.add(
+                    DownloadAttempt(
+                        phase=phase,
+                        ref_number=item.number,
+                        candidate_url=stamp_url,
+                        final_url=stamp_final_url,
+                        status_code=int(pdf_response.status_code),
+                        content_type=(pdf_response.headers.get("content-type") or ""),
+                        outcome="downloaded_pdf",
+                        waited_seconds=0.0,
+                        error="",
+                    )
+                )
+                return "downloaded"
 
             html_text = collect_stream_text(pdf_first_chunk, pdf_chunks)
             direct_pdf_url = extract_ieee_pdf_url(html_text, base_url=stamp_final_url, arnumber=arnumber)
@@ -174,54 +167,45 @@ def handle_ieee_html(
                     if not (direct_first and is_probably_pdf(direct_first)):
                         break
 
-                    out_file = downloads_dir / f"{prefix}.pdf"
-                    tmp_file = downloads_dir / f"{prefix}.pdf.part"
-                    try:
-                        with tmp_file.open("wb") as f:
-                            f.write(direct_first)
-                            for chunk in direct_chunks:
-                                if chunk:
-                                    f.write(chunk)
-                        tmp_file.replace(out_file)
-                        if verify_title_rename:
-                            handled = verify_downloaded_pdf_and_update_item(
-                                item=item,
-                                out_file=out_file,
-                                downloads_dir=downloads_dir,
-                                verified_dir=verified_dir,
-                                mismatch_dir=mismatch_dir,
-                                final_url=final_pdf_url,
-                                candidate_url=direct_pdf_url,
-                                status_code=int(direct_response.status_code),
-                                content_type=(direct_response.headers.get("content-type") or ""),
-                                phase=phase,
-                                logger=logger,
-                                verify_title_threshold=float(verify_title_threshold),
-                                verify_rename_mode=str(verify_rename_mode or "number_and_original"),
-                                verify_weights=verify_weights,
-                            )
-                            return "downloaded" if item.download_status == "downloaded_pdf" else "continue"
-
-                        item.download_status = "downloaded_pdf"
-                        item.downloaded_file = out_file.name
-                        item.note = final_pdf_url
-                        logger.add(
-                            DownloadAttempt(
-                                phase=phase,
-                                ref_number=item.number,
-                                candidate_url=direct_pdf_url,
-                                final_url=final_pdf_url,
-                                status_code=int(direct_response.status_code),
-                                content_type=(direct_response.headers.get("content-type") or ""),
-                                outcome="downloaded_pdf",
-                                waited_seconds=0.0,
-                                error="",
-                            )
+                    out_file = save_pdf_stream(downloads_dir / f"{prefix}.pdf", chain([direct_first], direct_chunks))
+                    if out_file is None:
+                        return "continue"
+                    if verify_title_rename:
+                        handled = verify_downloaded_pdf_and_update_item(
+                            item=item,
+                            out_file=out_file,
+                            downloads_dir=downloads_dir,
+                            verified_dir=verified_dir,
+                            mismatch_dir=mismatch_dir,
+                            final_url=final_pdf_url,
+                            candidate_url=direct_pdf_url,
+                            status_code=int(direct_response.status_code),
+                            content_type=(direct_response.headers.get("content-type") or ""),
+                            phase=phase,
+                            logger=logger,
+                            verify_title_threshold=float(verify_title_threshold),
+                            verify_rename_mode=str(verify_rename_mode or "number_and_original"),
+                            verify_weights=verify_weights,
                         )
-                        return "downloaded"
-                    finally:
-                        if tmp_file.exists():
-                            tmp_file.unlink(missing_ok=True)
+                        return "downloaded" if item.download_status == "downloaded_pdf" else "continue"
+
+                    item.download_status = "downloaded_pdf"
+                    item.downloaded_file = out_file.name
+                    item.note = final_pdf_url
+                    logger.add(
+                        DownloadAttempt(
+                            phase=phase,
+                            ref_number=item.number,
+                            candidate_url=direct_pdf_url,
+                            final_url=final_pdf_url,
+                            status_code=int(direct_response.status_code),
+                            content_type=(direct_response.headers.get("content-type") or ""),
+                            outcome="downloaded_pdf",
+                            waited_seconds=0.0,
+                            error="",
+                        )
+                    )
+                    return "downloaded"
                 finally:
                     if direct_response is not None:
                         direct_response.close()
